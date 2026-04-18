@@ -1,0 +1,16 @@
+name: graph_rag
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - huggingface_hub
+    - langchain
+    - langchain-chroma 
+    - langchain-community
+    - langchain-openai
+    - langchain-text-splitters
+    - markitdown[pdf]
+    - pandas

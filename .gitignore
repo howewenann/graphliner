@@ -1,0 +1,32 @@
+# --- IDEs / Editors ---
+.vscode/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and credentials
+.env
+.flaskenv
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Large data files
+/data
+*.parquet
+*.csv
+
+# models
+/models
