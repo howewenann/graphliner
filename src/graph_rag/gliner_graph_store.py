@@ -3,6 +3,7 @@ import uuid
 import networkx as nx
 import pandas as pd
 
+from collections import deque
 from tqdm import tqdm
 from typing import Optional
 from pathlib import Path
@@ -17,6 +18,7 @@ class GLiNERGraphStore:
 		labels: list[str],
 		persist_directory: Optional[str] = None,
 		relations: Optional[list[str]] = None,
+		add_inverse_relations: bool = False,
 		threshold: float = 0.7,
 		relation_threshold: float = 0.5,
 		graph_id_key: str = "graph_id"
@@ -54,6 +56,7 @@ class GLiNERGraphStore:
 		# store level defaults
 		self.labels_: list[str] = labels
 		self.relations_: list[str] = relations or []
+		self.add_inverse_relations_ : bool = add_inverse_relations
 		self.threshold_: float = float(threshold)
 		self.relation_threshold_: float = float(relation_threshold)
 		self.graph_id_key_: str = graph_id_key
@@ -243,13 +246,30 @@ class GLiNERGraphStore:
 			)
 		
 		if len(triplet) > 0:
-			self.graph_triplet = nx.from_pandas_edgelist(
-				df = triplet,
+			G = nx.from_pandas_edgelist(
+				df=triplet,
 				source='head',
 				target='tail',
 				edge_attr=['relation', 'edge_source'],
-				create_using=nx.MultiDiGraph() 
+				create_using=nx.MultiDiGraph()
 			)
+
+			# optional inverse edges
+			if self.add_inverse_relations_:
+				inverse_edges = []
+
+				for u, v, k, d in G.edges(keys=True, data=True):
+					inv = d.copy()
+					inv["relation"] = f"inverse_of:{d.get('relation')}"
+					inv["edge_source"] = d.get("edge_source")
+					inv["is_inverse"] = True
+
+					inverse_edges.append((v, u, inv))
+
+				for u, v, attr in inverse_edges:
+					G.add_edge(u, v, **attr)
+
+			self.graph_triplet = G
 		
 	# ----- Persistence: parquet + manifest (same base name) ------ #
 	def _persist(self) -> None:
@@ -340,4 +360,90 @@ class GLiNERGraphStore:
 
 		return enriched
 	
-	#TODO: Add methods for graph traversal
+	# --------------------------------------------------------------------
+	# Graph traversal
+	# --------------------------------------------------------------------
+
+	@staticmethod
+	def _nodes_exact_n_hop(graph, source, depth):
+		"""
+		Return nodes at exact shortest-path distance `depth` from `source`.
+
+		Args:
+			graph (nx.Graph | nx.DiGraph | nx.MultiDiGraph): Input graph.
+			source (node): Starting node.
+			depth (int): Exact hop distance from source.
+
+		Returns:
+			set: Nodes whose shortest-path distance from source equals `depth`.
+		"""
+		lengths = nx.single_source_shortest_path_length(graph, source, cutoff=depth)
+		return {node for node, dist in lengths.items() if dist == depth}
+	
+	@ staticmethod
+	def _n_hop_paths(graph, source, depth):
+		"""
+		Enumerate all edge-aware paths up to `depth` hops from `source`
+		and collect unique edge_source identifiers.
+
+		Args:
+			graph (nx.MultiDiGraph): Directed multigraph with edge attributes.
+			source (node): Starting node.
+			depth (int): Maximum path length in hops.
+
+		Returns:
+			tuple:
+				- list[list[tuple]]: All traversed paths, where each path is
+				a list of (u, v, edge_attr_dict).
+				- set: Unique `edge_source` values extracted from all edges in all paths.
+		"""
+		queue = deque([(source, [])])
+		results = []
+
+		while queue:
+			node, path = queue.popleft()
+
+			if len(path) > depth:
+				continue
+
+			if path:
+				results.append(path)
+
+			for u, v, d in graph.out_edges(node, data=True):
+				queue.append((
+					v,
+					path + [(u, v, d)]
+				))
+
+		# extract the graph ids (de-dep)
+		output = set(
+			d.get("edge_source")
+			for path in results     # each path
+			for (_, _, d) in path   # each hop
+			)
+
+		return results, output
+	
+
+	def traversal_search(self, source: list[str], depth=1):
+		
+		# 1) Return entity linked
+		entity_linked_ids = set().union(*[
+			self._nodes_exact_n_hop(self.graph_entity_link, s, depth=2)
+			for s in source
+		])
+
+		# 2) Return relationship linked
+		triplet_ids = set()
+		if self.graph_triplet is not None:
+			entry_nodes = set().union(*[
+				self._nodes_exact_n_hop(self.graph_entity_link, s, depth=1)
+				for s in source
+			])
+			
+			triplet_ids = set().union(*[
+				self._n_hop_paths(self.graph_triplet, node, depth=depth)[1]
+				for node in entry_nodes
+			])
+
+		return list(set(source) | entity_linked_ids | triplet_ids)
