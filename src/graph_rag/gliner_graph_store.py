@@ -425,12 +425,12 @@ class GLiNERGraphStore:
 		return results, output
 	
 
-	def traversal_search(self, source: list[str], depth=1):
+	def traversal_search(self, start_doc_ids: list[str], depth=1):
 		
 		# 1) Return entity linked
 		entity_linked_ids = set().union(*[
 			self._nodes_exact_n_hop(self.graph_entity_link, s, depth=2)
-			for s in source
+			for s in start_doc_ids
 		])
 
 		# 2) Return relationship linked
@@ -438,7 +438,7 @@ class GLiNERGraphStore:
 		if self.graph_triplet is not None:
 			entry_nodes = set().union(*[
 				self._nodes_exact_n_hop(self.graph_entity_link, s, depth=1)
-				for s in source
+				for s in start_doc_ids
 			])
 			
 			triplet_ids = set().union(*[
@@ -446,4 +446,4 @@ class GLiNERGraphStore:
 				for node in entry_nodes
 			])
 
-		return list(set(source) | entity_linked_ids | triplet_ids)
+		return list(set(start_doc_ids) | entity_linked_ids | triplet_ids)
