@@ -17,3 +17,4 @@ dependencies:
     - markitdown[pdf]
     - networkx
     - pandas
+    - sentence_transformers
