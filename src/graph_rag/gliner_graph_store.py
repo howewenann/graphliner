@@ -5,7 +5,7 @@ import pandas as pd
 
 from collections import deque
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, List, Dict, Union
 from pathlib import Path
 from langchain_core.documents import Document
 
@@ -15,7 +15,7 @@ class GLiNERGraphStore:
 		self,
 		model_path: str,
 		collection_name: str,
-		labels: list[str],
+		labels: Union[List[str], Dict[str, str]],
 		persist_directory: Optional[str] = None,
 		relations: Optional[list[str]] = None,
 		add_inverse_relations: bool = False,
@@ -29,7 +29,7 @@ class GLiNERGraphStore:
 		Args:
 		    model_path (str): Path to the GLiNER model
 		    collection_name (str): Name of the collection to store data
-		    labels (list[str]): List of entity labels to extract
+		    labels (list[str] | dict[str, str]): List of entity labels to extract
 		    persist_directory (Optional[str]): Directory to persist data, defaults to None
 		    relations (Optional[list[str]]): List of relation types to extract, defaults to None
 		    threshold (float): Confidence threshold for entity extraction, defaults to 0.7
@@ -38,9 +38,18 @@ class GLiNERGraphStore:
 		"""
 
 		# ---- Validate required config early ---- #
-		if not labels or not isinstance(labels, list) or not all(isinstance(x, str) and x.strip() for x in labels):
-			raise ValueError("labels must be a non-empty list of non-empty strings")
-
+		if isinstance(labels, dict):
+			# If it's a dictionary, we assume the keys are the target entity types 
+			# that GLiNER needs to recognize for extraction.
+			if not all(isinstance(k, str) and k.strip() for k in labels.keys()):
+					raise ValueError("Dictionary keys (labels) must be non-empty strings.")
+		elif isinstance(labels, list):
+			# If it's a list, ensure all elements are valid entity type strings
+			if not all(isinstance(x, str) and x.strip() for x in labels):
+				raise ValueError("List elements (labels) must be non-empty strings.")
+		else:
+				raise TypeError("Labels must be either a list of strings or a dictionary mapping strings to strings.")
+			 
 		self.model_path = model_path
 		self.collection_name = collection_name
 		self.persist_directory = persist_directory
@@ -54,7 +63,7 @@ class GLiNERGraphStore:
 		self.graph_triplet: Optional[nx.MultiDiGraph] = None
 
 		# store level defaults
-		self.labels_: list[str] = labels
+		self.labels_: Union[List[str], Dict[str, str]] = labels
 		self.relations_: list[str] = relations or []
 		self.add_inverse_relations_ : bool = add_inverse_relations
 		self.threshold_: float = float(threshold)
