@@ -6,36 +6,16 @@ A LangChain-compatible retriever that combines:
   - A pluggable vectorstore for initial candidate retrieval
   - Two graph-traversal expansion strategies (auto and LLM-assisted)
 
-Auto traversal  (use_llm_filter=False, the default)
-----------------------------------------------------
-    retriever.invoke("Who founded OpenAI?")
-    # vector search → seed chunks → entity-link expand + triplet expand → docs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PIPELINE OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-LLM-assisted traversal  (use_llm_filter=True)
-----------------------------------------------
-The retriever exposes four methods that a LangGraph node can call in
-sequence.  The LLM is never imported here; this class only produces the
-inputs the LLM needs and consumes its decisions.
+Step 0 — Ingestion (always required first)
+------------------------------------------
+Build the knowledge graph and populate the vectorstore in one call.
+The retriever uses the vectorstore's own internal document IDs as the
+graph node identifiers — no extra metadata is stamped on documents.
 
-    Step 1  retriever.get_entry_entities(seed_ids)
-            → {"sam altman": "person", "openai": "organization", ...}
-
-    Step 2  retriever.build_entity_filter_schema(entities)
-            → a Pydantic model; pass to llm.with_structured_output(schema)
-            → LLM decides which entities are relevant to the query
-
-    Step 3  retriever.get_reachable_triples(selected_entities)
-            → [TripleRecord(text="sam altman (person) → founded → openai (organization)"), ...]
-
-    Step 4  retriever.build_triple_filter_schema(triples)
-            → a Pydantic model; pass to llm.with_structured_output(schema)
-            → LLM decides which triples are relevant to the query
-
-    Step 5  retriever.resolve_docs_from_triples(selected_triples)
-            → list[Document]
-
-Typical ingestion
------------------
     retriever = GLiNERGraphRetriever(
         vectorstore=my_chroma_store,
         model_path="urchade/gliner_mediumv2.1",
@@ -44,7 +24,79 @@ Typical ingestion
         relations=["founded", "located_in"],
         persist_directory="./graph_store",
     )
-    retriever.from_documents(docs)  # adds docs to vectorstore + builds graph
+    ids = retriever.from_documents(docs)
+
+    # Later — add more documents incrementally
+    new_ids = retriever.add_documents(more_docs)
+
+    # Or restore a previously persisted graph without re-running GLiNER
+    retriever.load()
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Path 1 — Auto traversal  (use_llm_filter=False, the default)
+-------------------------------------------------------------
+The simplest path.  Call ``invoke`` (or ``get_relevant_documents``) as
+with any LangChain retriever.  Graph expansion happens automatically
+using both entity-link and triplet traversal.
+
+    docs = retriever.invoke("Who founded OpenAI?")
+
+    # What happens internally:
+    #  1. Vector similarity search → k seed chunks
+    #  2. Entity-link expansion:
+    #       seed chunk → shared entity node → neighbouring chunk (2 hops)
+    #  3. Triplet expansion:
+    #       seed chunk → entity nodes → relation edges → connected chunks
+    #  4. Fetch and return all expanded chunks from the vectorstore
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Path 2 — LLM-assisted traversal  (use_llm_filter=True)
+-------------------------------------------------------
+Gives an LLM two decision points during traversal so that only
+graph-relevant entities and triples are followed.  Designed for use
+inside a LangGraph workflow.  The LLM is never imported here; this
+class only produces inputs the LLM needs and consumes its decisions.
+
+    # Wire up the retriever
+    retriever = GLiNERGraphRetriever(..., use_llm_filter=True)
+    retriever.from_documents(docs)         # or retriever.load()
+
+    # --- Inside your LangGraph node ---
+
+    # 1. Seed retrieval (plain vector search)
+    seed_docs = retriever.vectorstore.similarity_search(query, k=retriever.k)
+    seed_ids  = [doc.id for doc in seed_docs]
+
+    # 2. Collect candidate entities linked to those seed chunks
+    entities = retriever.get_entry_entities(seed_ids)
+    #    → {"sam altman": "person", "openai": "organization", ...}
+
+    # 3. LLM selects relevant entities
+    schema        = retriever.build_entity_filter_schema(entities)
+    decision      = llm.with_structured_output(schema).invoke(query)
+    selected_ents = {
+        e: t for e, t in entities.items()
+        if getattr(decision, e.replace(" ", "_"), False)
+    }
+
+    # 4. Collect triples reachable from the selected entities
+    triples = retriever.get_reachable_triples(selected_ents)
+    #    → [TripleRecord(text="sam altman (person) → founded → openai (organization)"), ...]
+
+    # 5. LLM selects relevant triples
+    schema           = retriever.build_triple_filter_schema(triples)
+    decision         = llm.with_structured_output(schema).invoke(query)
+    selected_triples = [
+        t for t in triples
+        if getattr(decision, t.id.replace("-", "_"), False)
+    ]
+
+    # 6. Resolve final documents from the selected triples
+    docs = retriever.resolve_docs_from_triples(selected_triples)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import json
@@ -91,7 +143,7 @@ class TripleRecord(BaseModel):
     relation:    str
     tail:        str
     tail_type:   str
-    edge_source: str   # chunk ID this triple was extracted from
+    edge_source: str   # vectorstore document ID this triple was extracted from
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +154,11 @@ class GLiNERGraphRetriever(BaseRetriever):
     """
     Retriever that builds a knowledge graph from documents using GLiNER,
     then expands vectorstore retrieval results via graph traversal.
+
+    The graph uses the vectorstore's own internal document IDs as node
+    identifiers.  Documents must have a populated ``id`` field (assigned
+    automatically by most LangChain vectorstores) before being passed to
+    ``from_documents`` or ``add_documents``.
 
     Args:
         vectorstore:           Any LangChain VectorStore (Chroma, FAISS, Qdrant …).
@@ -114,7 +171,6 @@ class GLiNERGraphRetriever(BaseRetriever):
         add_inverse_relations: Add reverse edges to the triplet graph.
         threshold:             Confidence threshold for entity extraction.
         relation_threshold:    Confidence threshold for relation extraction.
-        graph_id_key:          Metadata key used to store the per-document graph ID.
         k:                     Number of vectorstore candidates before graph expansion.
         traversal_depth:       Hops to traverse from each seed entity node.
         use_llm_filter:        If True, ``_get_relevant_documents`` raises
@@ -133,7 +189,6 @@ class GLiNERGraphRetriever(BaseRetriever):
     add_inverse_relations: bool                      = False
     threshold:             float                     = 0.7
     relation_threshold:    float                     = 0.5
-    graph_id_key:          str                       = "graph_id"
     k:                     int                       = 4
     traversal_depth:       int                       = 1
     use_llm_filter:        bool                      = False
@@ -179,6 +234,7 @@ class GLiNERGraphRetriever(BaseRetriever):
         """Lowercase and collapse internal whitespace."""
         return " ".join(str(text).strip().lower().split())
 
+
     # ------------------------------------------------------------------
     # GLiNER inference
     # ------------------------------------------------------------------
@@ -209,17 +265,18 @@ class GLiNERGraphRetriever(BaseRetriever):
     # Edge extraction
     # ------------------------------------------------------------------
 
-    def _extract_entity_edges(self, entities: list, graph_id: str) -> list[dict]:
+    def _extract_entity_edges(self, entities: list, doc_id: str) -> list[dict]:
         """
         Convert GLiNER entity dicts → ``__IN_CHUNK__`` edge records.
-        Each edge links an entity node to the chunk it was found in.
+        Each edge links an entity node to the document it was found in,
+        identified by the vectorstore's internal document ID.
         """
         return [
             {
                 "head":        self._normalize(e["text"]),
                 "head_type":   e["label"],
                 "relation":    RELATION_IN_CHUNK,
-                "tail":        graph_id,
+                "tail":        doc_id,
                 "tail_type":   NODE_TYPE_CHUNK,
                 "score":       float(e.get("score", 0.0)),
                 "graph_type":  GRAPH_TYPE_ENTITY,
@@ -229,10 +286,11 @@ class GLiNERGraphRetriever(BaseRetriever):
             if e.get("text") and e.get("label")
         ]
 
-    def _extract_relation_edges(self, relations: list, graph_id: str) -> list[dict]:
+    def _extract_relation_edges(self, relations: list, doc_id: str) -> list[dict]:
         """
         Convert GLiNER relation dicts → typed triplet edge records.
-        ``edge_source`` records which chunk each relation was extracted from.
+        ``edge_source`` records the vectorstore document ID for the document
+        each relation was extracted from.
         """
         return [
             {
@@ -243,7 +301,7 @@ class GLiNERGraphRetriever(BaseRetriever):
                 "tail_type":   r["tail"].get("type", ""),
                 "score":       float(r.get("score", 0.0)),
                 "graph_type":  GRAPH_TYPE_TRIPLET,
-                "edge_source": graph_id,
+                "edge_source": doc_id,
             }
             for r in relations
             if r.get("head") and r.get("tail") and r.get("relation")
@@ -257,39 +315,33 @@ class GLiNERGraphRetriever(BaseRetriever):
     def build_edge_list(
         self,
         documents: list[Document],
-        keep_existing_graph_ids: bool = True,
-    ) -> tuple[list[Document], pd.DataFrame, pd.DataFrame]:
+        ids: list[str],
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Run GLiNER over every document and produce two edge DataFrames:
-          - ``entity_df``   — entity ↔ chunk bipartite links
+          - ``entity_df``   — entity ↔ document bipartite links
           - ``relation_df`` — entity → entity typed triplets
 
-        Each document receives a ``graph_id`` in its metadata so it can be
-        located during traversal.
+        Args:
+            documents: The documents to process.
+            ids:       Vectorstore-assigned IDs in the same order as ``documents``.
 
         Returns:
-            (enriched_documents, entity_df, relation_df)
+            (entity_df, relation_df)
         """
         entity_rows:   list[dict] = []
         relation_rows: list[dict] = []
 
-        for doc in tqdm(documents, desc="Extracting graph edges"):
-            doc.metadata = doc.metadata or {}
-
-            # Assign a stable graph ID unless one already exists and we're keeping it
-            if (not keep_existing_graph_ids) or (self.graph_id_key not in doc.metadata):
-                doc.metadata[self.graph_id_key] = str(uuid.uuid4())
-
-            graph_id = doc.metadata[self.graph_id_key]
+        for doc, doc_id in tqdm(zip(documents, ids), desc="Extracting graph edges", total=len(documents)):
             raw_entities, raw_relations = self._run_inference(doc.page_content)
 
-            entity_rows.extend(self._extract_entity_edges(raw_entities, graph_id))
-            relation_rows.extend(self._extract_relation_edges(raw_relations, graph_id))
+            entity_rows.extend(self._extract_entity_edges(raw_entities, doc_id))
+            relation_rows.extend(self._extract_relation_edges(raw_relations, doc_id))
 
         entity_df   = self._rows_to_df(entity_rows,   dedup_cols=ENTITY_DEDUP_COLS)
         relation_df = self._rows_to_df(relation_rows, dedup_cols=TRIPLET_DEDUP_COLS)
 
-        return documents, entity_df, relation_df
+        return entity_df, relation_df
 
     @staticmethod
     def _rows_to_df(rows: list[dict], dedup_cols: list[str]) -> pd.DataFrame:
@@ -309,10 +361,10 @@ class GLiNERGraphRetriever(BaseRetriever):
     def _build_entity_link_graph(self, entity_edges: pd.DataFrame) -> nx.Graph:
         """
         Build an undirected bipartite graph:
-            entity_node — __IN_CHUNK__ — chunk_node (graph_id)
+            entity_node — __IN_CHUNK__ — doc_id (vectorstore internal ID)
 
-        Two chunks that share an entity are 2 hops apart in this graph,
-        which is how entity-link traversal discovers related chunks.
+        Two documents that share an entity are 2 hops apart in this graph,
+        which is how entity-link traversal discovers related documents.
         """
         return nx.from_pandas_edgelist(
             df=entity_edges,
@@ -395,7 +447,6 @@ class GLiNERGraphRetriever(BaseRetriever):
 
     def _save_manifest(self) -> None:
         manifest = {
-            "graph_id_key":       self.graph_id_key,
             "labels":             self.labels,
             "relations":          self.relations,
             "threshold":          self.threshold,
@@ -409,12 +460,11 @@ class GLiNERGraphRetriever(BaseRetriever):
             raise FileNotFoundError(f"Manifest not found: {path}")
 
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        required = ["graph_id_key", "labels", "relations", "threshold", "relation_threshold"]
+        required = ["labels", "relations", "threshold", "relation_threshold"]
         missing  = [k for k in required if k not in manifest]
         if missing:
             raise ValueError(f"Manifest is missing required keys: {missing}")
 
-        self.graph_id_key       = manifest["graph_id_key"]
         self.labels             = manifest["labels"]
         self.relations          = manifest["relations"]
         self.threshold          = manifest["threshold"]
@@ -438,56 +488,40 @@ class GLiNERGraphRetriever(BaseRetriever):
     # Public ingestion API
     # ------------------------------------------------------------------
 
-    def from_documents(
-        self,
-        documents: list[Document],
-        keep_existing_graph_ids: bool = True,
-    ) -> list[Document]:
+    def from_documents(self, documents: list[Document]) -> list[str]:
         """
         Index a fresh set of documents:
-          1. Run GLiNER to build the knowledge graph
-          2. Add the enriched documents to the vectorstore
+          1. Add documents to the vectorstore — returns the assigned IDs
+          2. Run GLiNER to build the knowledge graph using those IDs
           3. Persist graph to disk
 
-        Documents are added to the vectorstore *after* ``graph_id`` has been
-        stamped onto their metadata, so the ID is always present at query time.
-
-        Returns the enriched documents.
+        Returns the list of vectorstore-assigned document IDs.
         """
-        enriched, entity_df, relation_df = self.build_edge_list(
-            documents=documents,
-            keep_existing_graph_ids=keep_existing_graph_ids,
-        )
+        ids = self.vectorstore.add_documents(documents)
+
+        entity_df, relation_df = self.build_edge_list(documents, ids)
         self._edge_df = pd.concat([entity_df, relation_df], ignore_index=True)
         self._rebuild_graphs()
         self._persist()
 
-        # Add to vectorstore after graph_id is stamped on metadata
-        self.vectorstore.add_documents(enriched)
+        return ids
 
-        return enriched
-
-    def add_documents(
-        self,
-        documents: list[Document],
-        keep_existing_graph_ids: bool = True,
-    ) -> list[Document]:
+    def add_documents(self, documents: list[Document]) -> list[str]:
         """
         Incrementally add documents to an already-fitted store.
         New edges are merged with existing ones and deduplicated.
+
+        Returns the list of vectorstore-assigned document IDs.
         """
-        enriched, entity_df, relation_df = self.build_edge_list(
-            documents=documents,
-            keep_existing_graph_ids=keep_existing_graph_ids,
-        )
+        ids = self.vectorstore.add_documents(documents)
+
+        entity_df, relation_df = self.build_edge_list(documents, ids)
         new_edges     = pd.concat([entity_df, relation_df], ignore_index=True)
         self._edge_df = self._merge_edges(new_edges)
         self._rebuild_graphs()
         self._persist()
 
-        self.vectorstore.add_documents(enriched)
-
-        return enriched
+        return ids
 
     # ------------------------------------------------------------------
     # Traversal primitives (shared by both paths)
@@ -502,18 +536,18 @@ class GLiNERGraphRetriever(BaseRetriever):
         lengths = nx.single_source_shortest_path_length(graph, source, cutoff=depth)
         return {node for node, dist in lengths.items() if dist == depth}
 
-    def _entity_nodes_for_chunks(self, chunk_ids: list[str]) -> set[str]:
+    def _entity_nodes_for_chunks(self, doc_ids: list[str]) -> set[str]:
         """
         Return all entity nodes that are direct (1-hop) neighbours of the
-        given chunk IDs in the entity-link graph.
+        given document IDs in the entity-link graph.
         """
         if self._graph_entity_link is None:
             return set()
 
         return set().union(*[
-            self._nodes_at_exact_depth(self._graph_entity_link, chunk_id, depth=1)
-            for chunk_id in chunk_ids
-            if chunk_id in self._graph_entity_link
+            self._nodes_at_exact_depth(self._graph_entity_link, doc_id, depth=1)
+            for doc_id in doc_ids
+            if doc_id in self._graph_entity_link
         ])
 
     @staticmethod
@@ -524,12 +558,12 @@ class GLiNERGraphRetriever(BaseRetriever):
     ) -> set[str]:
         """
         BFS over the triplet graph starting from ``entry_node``.
-        Returns all ``edge_source`` chunk IDs found along traversed edges,
+        Returns all ``edge_source`` document IDs found along traversed edges,
         up to ``depth`` hops.
         """
         queue         = deque([(entry_node, 0)])
         visited_nodes = {entry_node}
-        chunk_ids:    set[str] = set()
+        doc_ids:      set[str] = set()
 
         while queue:
             node, current_depth = queue.popleft()
@@ -540,21 +574,21 @@ class GLiNERGraphRetriever(BaseRetriever):
             for _, neighbour, edge_data in graph.out_edges(node, data=True):
                 source_id = edge_data.get("edge_source")
                 if source_id:
-                    chunk_ids.add(source_id)
+                    doc_ids.add(source_id)
 
                 if neighbour not in visited_nodes:
                     visited_nodes.add(neighbour)
                     queue.append((neighbour, current_depth + 1))
 
-        return chunk_ids
+        return doc_ids
 
-    def _fetch_docs_by_chunk_ids(self, chunk_ids: list[str]) -> list[Document]:
+    def _fetch_docs_by_ids(self, doc_ids: list[str]) -> list[Document]:
         """
-        Retrieve Document objects from the vectorstore by their graph IDs.
+        Retrieve Document objects from the vectorstore by their internal IDs.
         Raises ``NotImplementedError`` for stores that don't support ``get_by_ids``.
         """
         if hasattr(self.vectorstore, "get_by_ids"):
-            return self.vectorstore.get_by_ids(chunk_ids)
+            return self.vectorstore.get_by_ids(doc_ids)
 
         raise NotImplementedError(
             "The configured vectorstore does not support get_by_ids. "
@@ -565,56 +599,57 @@ class GLiNERGraphRetriever(BaseRetriever):
     # Path 1 — Auto graph traversal
     # ------------------------------------------------------------------
 
-    def _auto_graph_expand(self, seed_chunk_ids: list[str]) -> list[str]:
+    def _auto_graph_expand(self, seed_doc_ids: list[str]) -> list[str]:
         """
-        Expand a set of seed chunk IDs automatically by traversing both graphs.
+        Expand a set of seed document IDs automatically by traversing both graphs.
 
         Entity-link expansion (undirected bipartite, always 2 hops):
-            seed chunk → shared entity node → neighbouring chunk
+            seed doc → shared entity node → neighbouring doc
 
         Triplet expansion (directed multigraph, up to ``traversal_depth`` hops):
-            seed chunk → entity nodes → relation edges → connected chunk IDs
+            seed doc → entity nodes → relation edges → connected doc IDs
         """
-        # Chunks that share at least one entity with a seed chunk
-        entity_linked_chunk_ids = set().union(*[
-            self._nodes_at_exact_depth(self._graph_entity_link, chunk_id, depth=2)
-            for chunk_id in seed_chunk_ids
-            if self._graph_entity_link and chunk_id in self._graph_entity_link
+        # Docs that share at least one entity with a seed doc
+        entity_linked_doc_ids = set().union(*[
+            self._nodes_at_exact_depth(self._graph_entity_link, doc_id, depth=2)
+            for doc_id in seed_doc_ids
+            if self._graph_entity_link and doc_id in self._graph_entity_link
         ])
 
-        # Entity nodes attached to the seed chunks (entry points for triplet traversal)
-        entry_entity_nodes = self._entity_nodes_for_chunks(seed_chunk_ids)
+        # Entity nodes attached to the seed docs (entry points for triplet traversal)
+        entry_entity_nodes = self._entity_nodes_for_chunks(seed_doc_ids)
 
-        # Follow relation edges from those entities to discover more chunk IDs
-        relation_linked_chunk_ids: set[str] = set()
+        # Follow relation edges from those entities to discover more doc IDs
+        relation_linked_doc_ids: set[str] = set()
         if self._graph_triplet is not None:
-            relation_linked_chunk_ids = set().union(*[
+            relation_linked_doc_ids = set().union(*[
                 self._chunk_ids_reachable_from(self._graph_triplet, entity, self.traversal_depth)
                 for entity in entry_entity_nodes
                 if entity in self._graph_triplet
             ])
 
-        return list(set(seed_chunk_ids) | entity_linked_chunk_ids | relation_linked_chunk_ids)
+        return list(set(seed_doc_ids) | entity_linked_doc_ids | relation_linked_doc_ids)
 
     # ------------------------------------------------------------------
     # Path 2 — LLM-assisted traversal (stateless helpers for LangGraph)
     # ------------------------------------------------------------------
 
-    def get_entry_entities(self, seed_chunk_ids: list[str]) -> Dict[str, str]:
+    def get_entry_entities(self, seed_doc_ids: list[str]) -> Dict[str, str]:
         """
-        **LangGraph step 1 of 4** — Collect candidate entities from seed chunks.
+        **LangGraph step 1 of 4** — Collect candidate entities from seed documents.
 
         Returns a ``{entity_text: entity_type}`` mapping for all entities
-        found in the seed chunks.  Pass this to ``build_entity_filter_schema``
+        found in the seed documents.  Pass this to ``build_entity_filter_schema``
         to create the structured-output schema for the LLM.
 
         Args:
-            seed_chunk_ids: Graph IDs of the chunks returned by vector search.
+            seed_doc_ids: Vectorstore internal IDs of the documents returned
+                          by similarity search (i.e. ``[doc.id for doc in seed_docs]``).
 
         Returns:
             Dict mapping normalised entity text → entity type label.
         """
-        entity_nodes = self._entity_nodes_for_chunks(seed_chunk_ids)
+        entity_nodes = self._entity_nodes_for_chunks(seed_doc_ids)
 
         if self._edge_df is None or not entity_nodes:
             return {}
@@ -776,7 +811,7 @@ class GLiNERGraphRetriever(BaseRetriever):
         Terminal step of the LLM-assisted path.
 
         Takes the triples the LLM selected and fetches the source Documents
-        from the vectorstore.
+        from the vectorstore using the internal IDs stored in ``edge_source``.
 
         Args:
             selected_triples: Filtered list of ``TripleRecord`` objects.
@@ -784,8 +819,8 @@ class GLiNERGraphRetriever(BaseRetriever):
         Returns:
             Deduplicated list of ``Document`` objects.
         """
-        chunk_ids = list({t.edge_source for t in selected_triples if t.edge_source})
-        return self._fetch_docs_by_chunk_ids(chunk_ids)
+        doc_ids = list({t.edge_source for t in selected_triples if t.edge_source})
+        return self._fetch_docs_by_ids(doc_ids)
 
     # ------------------------------------------------------------------
     # LangChain BaseRetriever interface
@@ -800,7 +835,7 @@ class GLiNERGraphRetriever(BaseRetriever):
         """
         Retrieval pipeline (auto traversal, ``use_llm_filter=False``):
           1. Similarity search → seed docs
-          2. Extract graph IDs from seed docs
+          2. Extract internal IDs from seed docs
           3. Auto-expand via entity-link + triplet graphs
           4. Fetch and return expanded docs
 
@@ -810,9 +845,9 @@ class GLiNERGraphRetriever(BaseRetriever):
         if self.use_llm_filter:
             raise NotImplementedError(
                 "use_llm_filter=True: orchestrate retrieval via LangGraph instead of .invoke().\n\n"
-                "  seed_docs    = vectorstore.similarity_search(query, k=k)\n"
-                "  seed_ids     = [doc.metadata[graph_id_key] for doc in seed_docs]\n\n"
-                "  # Step 1 — collect candidate entities from seed chunks\n"
+                "  seed_docs    = retriever.vectorstore.similarity_search(query, k=retriever.k)\n"
+                "  seed_ids     = [doc.id for doc in seed_docs]\n\n"
+                "  # Step 1 — collect candidate entities from seed documents\n"
                 "  entities     = retriever.get_entry_entities(seed_ids)\n\n"
                 "  # Step 2 — LLM selects relevant entities\n"
                 "  schema       = retriever.build_entity_filter_schema(entities)\n"
@@ -831,16 +866,11 @@ class GLiNERGraphRetriever(BaseRetriever):
 
         # --- Auto path ---
         seed_docs = self.vectorstore.similarity_search(query, k=self.k)
-
-        seed_ids = [
-            doc.metadata[self.graph_id_key]
-            for doc in seed_docs
-            if self.graph_id_key in doc.metadata
-        ]
+        seed_ids  = [doc.id for doc in seed_docs if doc.id]
 
         # Graph not built yet — fall back to raw vector results
         if not seed_ids or self._graph_entity_link is None:
             return seed_docs
 
         expanded_ids = self._auto_graph_expand(seed_ids)
-        return self._fetch_docs_by_chunk_ids(expanded_ids)
+        return self._fetch_docs_by_ids(expanded_ids)
