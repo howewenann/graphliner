@@ -1,4 +1,4 @@
-name: graph_rag
+name: graphliner
 channels:
   - conda-forge
   - defaults
