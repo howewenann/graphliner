@@ -1,6 +1,6 @@
 # GLiNERGraphRetriever
 
-A LangChain-compatible retriever that builds a knowledge graph from your documents using [GLiNER](https://github.com/urchade/GLiNER) and uses it to retrieve richer, more connected context than vector search alone.
+A LangChain-compatible retriever that builds a knowledge graph from your documents using [GLiNER-ReLEx](https://huggingface.co/knowledgator/gliner-relex-large-v1.0) and uses it to retrieve richer, more connected context than vector search alone.
 
 ---
 
@@ -130,7 +130,7 @@ from gliner_graph_retriever import GLiNERGraphRetriever
 # 1. Instantiate
 retriever = GLiNERGraphRetriever(
     vectorstore=Chroma(embedding_function=OpenAIEmbeddings()),
-    model_path="urchade/gliner_mediumv2.1",
+    model_path="knowledgator/gliner-relex-large-v1.0",
     collection_name="my_docs",
     labels=["person", "organization", "location"],
     relations=["founded", "located_in", "acquired"],
