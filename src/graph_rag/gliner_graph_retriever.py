@@ -3,7 +3,7 @@ GLiNERGraphRetriever
 ====================
 A LangChain-compatible retriever that combines:
   - GLiNER NER/relation extraction → a NetworkX knowledge graph
-  - A pluggable vectorstore for initial candidate retrieval
+  - A pluggable vectorstore for candidate retrieval
   - Two graph-traversal expansion strategies (auto and LLM-assisted)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -42,68 +42,45 @@ using both entity-link and triplet traversal.
 
     docs = retriever.invoke("Who founded OpenAI?")
 
-    # What happens internally:
-    #  1. Vector similarity search → k seed chunks
-    #  2. Entity-link expansion:
-    #       seed chunk → shared entity node → neighbouring chunk (2 hops)
-    #  3. Triplet expansion:
-    #       seed chunk → entity nodes → relation edges → connected chunks
-    #  4. Fetch and return all expanded chunks from the vectorstore
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Path 2 — LLM-assisted traversal  (use_llm_filter=True)
 -------------------------------------------------------
-Gives an LLM two decision points during traversal so that only
-graph-relevant entities and triples are followed.  Designed for use
-inside a LangGraph workflow.  The LLM is never imported here; this
-class only produces inputs the LLM needs and consumes its decisions.
+When ``llm`` is provided, the full path-2 pipeline runs automatically
+inside ``invoke``/``get_relevant_documents``.
 
-    # Wire up the retriever
-    retriever = GLiNERGraphRetriever(..., use_llm_filter=True)
-    retriever.from_documents(docs)         # or retriever.load()
+When ``llm`` is None, ``_get_relevant_documents`` raises
+``NotImplementedError`` with step-by-step guidance for wiring the
+helper methods manually inside a LangGraph node.
 
-    # --- Inside your LangGraph node ---
+    retriever = GLiNERGraphRetriever(
+        ...,
+        use_llm_filter=True,
+        llm=ChatOpenAI(model="gpt-4o"),
+    )
+    docs = retriever.invoke("Who founded OpenAI?")
 
-    # 1. Seed retrieval (plain vector search)
-    seed_docs = retriever.vectorstore.similarity_search(query, k=retriever.k)
+    # Or wire it manually in LangGraph:
+
+    seed_docs = retriever.seed_search(query)
     seed_ids  = [doc.id for doc in seed_docs]
 
-    # 2. Collect candidate entities linked to those seed chunks
-    entities = retriever.get_entry_entities(seed_ids)
-    #    → {"sam altman": "person", "openai": "organization", ...}
+    entities      = retriever.get_entry_entities(seed_ids)
+    selected_ents = retriever.filter_entities_with_llm(query, entities, seed_docs)
 
-    # 3. LLM selects relevant entities
-    schema        = retriever.build_entity_filter_schema(entities)
-    decision      = llm.with_structured_output(schema).invoke(query)
-    selected_ents = {
-        e: t for e, t in entities.items()
-        if getattr(decision, e.replace(" ", "_"), False)
-    }
+    triples          = retriever.get_reachable_triples(selected_ents)
+    selected_triples = retriever.filter_triples_with_llm(query, triples)
 
-    # 4. Collect triples reachable from the selected entities
-    triples = retriever.get_reachable_triples(selected_ents)
-    #    → [TripleRecord(text="sam altman (person) → founded → openai (organization)"), ...]
-
-    # 5. LLM selects relevant triples
-    schema           = retriever.build_triple_filter_schema(triples)
-    decision         = llm.with_structured_output(schema).invoke(query)
-    selected_triples = [
-        t for t in triples
-        if getattr(decision, t.id.replace("-", "_"), False)
-    ]
-
-    # 6. Resolve final documents from the selected triples
     docs = retriever.resolve_docs_from_triples(selected_triples)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import json
+import textwrap
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union, get_args
 
 import networkx as nx
 import pandas as pd
@@ -147,6 +124,95 @@ class TripleRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Schema builders — List[Literal[...]] approach
+# ---------------------------------------------------------------------------
+
+def _build_entity_filter_schema(entities: Dict[str, str]) -> Type[BaseModel]:
+    """
+    Build a structured-output schema that asks the LLM to select a subset of
+    entities by returning their names in a list.
+
+    A single ``List[Literal[name1, name2, ...]]`` field is used rather than
+    one bool per entity.  This lets the LLM make a single, coherent selection
+    decision instead of N independent binary ones, which is both faster and
+    more accurate.
+
+    The field description includes the entity type for each candidate so the
+    LLM has full context without needing to infer types from names alone.
+
+    Args:
+        entities: ``{entity_text: entity_type}`` mapping from ``get_entry_entities``.
+
+    Returns:
+        A dynamically-created Pydantic model class with a single
+        ``selected_entities`` field.
+    """
+    if not entities:
+        # Degenerate case: no candidates — return a model with an empty-only field
+        return create_model(
+            "EntityFilterSchema",
+            selected_entities=(List[str], Field(default_factory=list, description="No entities available.")),
+        )
+
+    # Build a Literal type whose values are the entity names
+    names      = tuple(entities.keys())
+    lit_type   = Literal[names]  # type: ignore[valid-type]
+
+    description = (
+        "Select the entity names that are relevant to answering the query. "
+        "Available entities and their types:\n"
+        + "\n".join(f"  • {name}  ({etype})" for name, etype in entities.items())
+    )
+
+    return create_model(
+        "EntityFilterSchema",
+        selected_entities=(
+            List[lit_type],  # type: ignore[valid-type]
+            Field(default_factory=list, description=description),
+        ),
+    )
+
+
+def _build_triple_filter_schema(triples: List[TripleRecord]) -> Type[BaseModel]:
+    """
+    Build a structured-output schema that asks the LLM to select a subset of
+    triples by returning their IDs in a list.
+
+    Same design as ``_build_entity_filter_schema``: one
+    ``List[Literal[id1, id2, ...]]`` field instead of one bool per triple.
+
+    Args:
+        triples: Output of ``get_reachable_triples``.
+
+    Returns:
+        A dynamically-created Pydantic model class with a single
+        ``selected_triple_ids`` field.
+    """
+    if not triples:
+        return create_model(
+            "TripleFilterSchema",
+            selected_triple_ids=(List[str], Field(default_factory=list, description="No triples available.")),
+        )
+
+    ids      = tuple(t.id for t in triples)
+    lit_type = Literal[ids]  # type: ignore[valid-type]
+
+    description = (
+        "Select the triple IDs that contain information relevant to answering the query. "
+        "Available triples:\n"
+        + "\n".join(f"  • {t.id}: {t.text}" for t in triples)
+    )
+
+    return create_model(
+        "TripleFilterSchema",
+        selected_triple_ids=(
+            List[lit_type],  # type: ignore[valid-type]
+            Field(default_factory=list, description=description),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
 
@@ -162,6 +228,8 @@ class GLiNERGraphRetriever(BaseRetriever):
 
     Args:
         vectorstore:           Any LangChain VectorStore (Chroma, FAISS, Qdrant …).
+                               Always used for ingestion (``add_documents``) and
+                               ``get_by_ids``.
         model_path:            HuggingFace path or local path to the GLiNER model.
         collection_name:       Identifier for persisted files (parquet + manifest).
         labels:                Entity labels for GLiNER — list[str] or dict[str, str].
@@ -173,25 +241,30 @@ class GLiNERGraphRetriever(BaseRetriever):
         relation_threshold:    Confidence threshold for relation extraction.
         k:                     Number of vectorstore candidates before graph expansion.
         traversal_depth:       Hops to traverse from each seed entity node.
-        use_llm_filter:        If True, ``_get_relevant_documents`` raises
-                               ``NotImplementedError`` with instructions to use the
-                               LangGraph helper methods instead.  Defaults to False
-                               (auto traversal).
+        use_llm_filter:        If True, enables the LLM-assisted traversal path.
+                               Requires ``llm`` to be set for automatic execution;
+                               otherwise raises ``NotImplementedError`` with manual
+                               wiring instructions.  Defaults to False (auto traversal).
+        llm:                   Optional LangChain chat model.  When set and
+                               ``use_llm_filter=True``, the full path-2 pipeline runs
+                               automatically inside ``invoke``.
     """
 
     # Pydantic fields — LangChain BaseRetriever is a Pydantic v1 model
-    vectorstore:           VectorStore               = Field(...)
+    vectorstore:           VectorStore                    = Field(...)
     model_path:            str
     collection_name:       str
     labels:                Union[List[str], Dict[str, str]]
-    persist_directory:     Optional[str]             = None
-    relations:             List[str]                 = Field(default_factory=list)
-    add_inverse_relations: bool                      = False
-    threshold:             float                     = 0.7
-    relation_threshold:    float                     = 0.5
-    k:                     int                       = 4
-    traversal_depth:       int                       = 1
-    use_llm_filter:        bool                      = False
+    persist_directory:     Optional[str]                  = None
+    relations:             List[str]                      = Field(default_factory=list)
+    add_inverse_relations: bool                           = False
+    threshold:             float                          = 0.7
+    relation_threshold:    float                          = 0.5
+    k:                     int                            = 4
+    traversal_depth:       int                            = 1
+    # LLM-assisted path
+    use_llm_filter:        bool                           = False
+    llm:                   Optional[Any]                  = None
 
     # Private runtime state — excluded from the Pydantic schema
     _ner_extractor:     object                       = None
@@ -234,6 +307,21 @@ class GLiNERGraphRetriever(BaseRetriever):
         """Lowercase and collapse internal whitespace."""
         return " ".join(str(text).strip().lower().split())
 
+    # ------------------------------------------------------------------
+    # Seed retrieval
+    # ------------------------------------------------------------------
+
+    def seed_search(self, query: str) -> List[Document]:
+        """
+        Run the initial similarity search that produces seed documents.
+
+        Args:
+            query: The user's query string.
+
+        Returns:
+            Up to ``self.k`` seed documents.
+        """
+        return self.vectorstore.similarity_search(query, k=self.k)
 
     # ------------------------------------------------------------------
     # GLiNER inference
@@ -631,7 +719,7 @@ class GLiNERGraphRetriever(BaseRetriever):
         return list(set(seed_doc_ids) | entity_linked_doc_ids | relation_linked_doc_ids)
 
     # ------------------------------------------------------------------
-    # Path 2 — LLM-assisted traversal (stateless helpers for LangGraph)
+    # Path 2 — LLM-assisted traversal helpers
     # ------------------------------------------------------------------
 
     def get_entry_entities(self, seed_doc_ids: list[str]) -> Dict[str, str]:
@@ -639,8 +727,8 @@ class GLiNERGraphRetriever(BaseRetriever):
         **LangGraph step 1 of 4** — Collect candidate entities from seed documents.
 
         Returns a ``{entity_text: entity_type}`` mapping for all entities
-        found in the seed documents.  Pass this to ``build_entity_filter_schema``
-        to create the structured-output schema for the LLM.
+        found in the seed documents.  Pass this to ``filter_entities_with_llm``
+        (or ``build_entity_filter_schema`` for manual wiring).
 
         Args:
             seed_doc_ids: Vectorstore internal IDs of the documents returned
@@ -665,26 +753,16 @@ class GLiNERGraphRetriever(BaseRetriever):
 
         return entities
 
+    # ---- Entity filtering ---------------------------------------------------
+
     @staticmethod
     def build_entity_filter_schema(entities: Dict[str, str]) -> Type[BaseModel]:
         """
-        **LangGraph step 2 of 4** — Build the LLM structured-output schema for entities.
+        Build the LLM structured-output schema for entity selection.
 
-        Creates a Pydantic model on the fly with one ``bool`` field per entity.
-        The field name is a safe Python identifier (spaces → underscores); the
-        field description includes the entity type so the LLM has full context.
-
-        Usage::
-
-            schema   = retriever.build_entity_filter_schema(entities)
-            decision = llm.with_structured_output(schema).invoke(query)
-
-            # Recover selected entities, mapping safe field names back to originals
-            selected = {
-                entity_text: entity_type
-                for entity_text, entity_type in entities.items()
-                if getattr(decision, entity_text.replace(" ", "_"), False)
-            }
+        Returns a Pydantic model with a single ``selected_entities``
+        ``List[Literal[...]]`` field.  The LLM selects a subset of entity
+        names rather than answering N independent boolean questions.
 
         Args:
             entities: Output of ``get_entry_entities``.
@@ -692,14 +770,64 @@ class GLiNERGraphRetriever(BaseRetriever):
         Returns:
             A dynamically-created Pydantic model class.
         """
-        fields = {
-            entity_text.replace(" ", "_"): (
-                bool,
-                Field(default=False, description=f"Include '{entity_text}' ({entity_type})?"),
-            )
-            for entity_text, entity_type in entities.items()
-        }
-        return create_model("EntityFilterSchema", **fields)
+        return _build_entity_filter_schema(entities)
+
+    @staticmethod
+    def _format_seed_chunks(seed_docs: List[Document]) -> str:
+        """
+        Format retrieved seed documents into a readable context block for the
+        entity-filter prompt.  Truncates each chunk to 400 characters to keep
+        the prompt concise while still giving the LLM grounding.
+        """
+        lines = []
+        for i, doc in enumerate(seed_docs, 1):
+            snippet = textwrap.shorten(doc.page_content, width=400, placeholder=" …")
+            lines.append(f"[Chunk {i}]\n{snippet}")
+        return "\n\n".join(lines)
+
+    def filter_entities_with_llm(
+        self,
+        query: str,
+        entities: Dict[str, str],
+        seed_docs: List[Document],
+    ) -> Dict[str, str]:
+        """
+        **LangGraph step 2 of 4** — Use the LLM to select relevant entities.
+
+        The prompt includes both the candidate entity list *and* the retrieved
+        seed chunks so the LLM can ground its decision in actual content rather
+        than picking from abstract names.
+
+        Args:
+            query:      The user's query string.
+            entities:   Output of ``get_entry_entities``.
+            seed_docs:  The seed documents returned by the similarity search —
+                        their text is injected into the prompt as context.
+
+        Returns:
+            A filtered ``{entity_text: entity_type}`` dict containing only the
+            entities the LLM judged relevant.
+        """
+        if not entities:
+            return {}
+
+        schema        = _build_entity_filter_schema(entities)
+        chunk_context = self._format_seed_chunks(seed_docs)
+
+        prompt = (
+            f"Query: {query}\n\n"
+            f"Retrieved context:\n{chunk_context}\n\n"
+            "From the candidate entities listed in the schema description, "
+            "select those that are relevant to answering the query. "
+            "Use the retrieved context above to inform your selection."
+        )
+
+        decision       = self.llm.with_structured_output(schema).invoke(prompt)
+        selected_names = set(decision.selected_entities)
+
+        return {name: etype for name, etype in entities.items() if name in selected_names}
+
+    # ---- Triple filtering ---------------------------------------------------
 
     def get_reachable_triples(self, selected_entities: Dict[str, str]) -> List[TripleRecord]:
         """
@@ -711,8 +839,6 @@ class GLiNERGraphRetriever(BaseRetriever):
         The ``text`` field of each record is human-readable::
 
             sam altman (person) → founded → openai (organization)
-
-        Pass the result to ``build_triple_filter_schema``.
 
         Args:
             selected_entities: ``{entity_text: entity_type}`` from the LLM decision.
@@ -774,22 +900,10 @@ class GLiNERGraphRetriever(BaseRetriever):
     @staticmethod
     def build_triple_filter_schema(triples: List[TripleRecord]) -> Type[BaseModel]:
         """
-        **LangGraph step 4 of 4** — Build the LLM structured-output schema for triples.
+        Build the LLM structured-output schema for triple selection.
 
-        Same pattern as ``build_entity_filter_schema``: one ``bool`` field per
-        triple, keyed by the triple's ``id`` (hyphens replaced with underscores).
-        The field description is the human-readable ``text`` field.
-
-        Usage::
-
-            schema   = retriever.build_triple_filter_schema(triples)
-            decision = llm.with_structured_output(schema).invoke(query)
-
-            selected_triples = [
-                t for t in triples
-                if getattr(decision, t.id.replace("-", "_"), False)
-            ]
-            docs = retriever.resolve_docs_from_triples(selected_triples)
+        Returns a Pydantic model with a single ``selected_triple_ids``
+        ``List[Literal[...]]`` field.
 
         Args:
             triples: Output of ``get_reachable_triples``.
@@ -797,14 +911,40 @@ class GLiNERGraphRetriever(BaseRetriever):
         Returns:
             A dynamically-created Pydantic model class.
         """
-        fields = {
-            triple.id.replace("-", "_"): (
-                bool,
-                Field(default=False, description=f"Include: {triple.text}"),
-            )
-            for triple in triples
-        }
-        return create_model("TripleFilterSchema", **fields)
+        return _build_triple_filter_schema(triples)
+
+    def filter_triples_with_llm(
+        self,
+        query: str,
+        triples: List[TripleRecord],
+    ) -> List[TripleRecord]:
+        """
+        **LangGraph step 4 of 4** — Use the LLM to select relevant triples.
+
+        Unlike entity filtering, triples are self-describing (each has a
+        human-readable ``text`` field), so no extra chunk context is needed.
+
+        Args:
+            query:   The user's query string.
+            triples: Output of ``get_reachable_triples``.
+
+        Returns:
+            A filtered list of ``TripleRecord`` objects.
+        """
+        if not triples:
+            return []
+
+        schema   = _build_triple_filter_schema(triples)
+        prompt   = (
+            f"Query: {query}\n\n"
+            "From the candidate triples listed in the schema description, "
+            "select those that contain information relevant to answering the query."
+        )
+
+        decision         = self.llm.with_structured_output(schema).invoke(prompt)
+        selected_ids     = set(decision.selected_triple_ids)
+
+        return [t for t in triples if t.id in selected_ids]
 
     def resolve_docs_from_triples(self, selected_triples: List[TripleRecord]) -> List[Document]:
         """
@@ -833,39 +973,57 @@ class GLiNERGraphRetriever(BaseRetriever):
         run_manager: CallbackManagerForRetrieverRun,
     ) -> List[Document]:
         """
-        Retrieval pipeline (auto traversal, ``use_llm_filter=False``):
-          1. Similarity search → seed docs
-          2. Extract internal IDs from seed docs
-          3. Auto-expand via entity-link + triplet graphs
-          4. Fetch and return expanded docs
+        Unified retrieval dispatch:
 
-        When ``use_llm_filter=True``, raises ``NotImplementedError`` with a
-        step-by-step guide for wiring the LangGraph helper methods.
+        Path 1 (``use_llm_filter=False``):
+          1. Seed search (vectorstore or pluggable retriever)
+          2. Auto-expand via entity-link + triplet graphs
+          3. Fetch and return expanded docs
+
+        Path 2 (``use_llm_filter=True``, ``llm`` provided):
+          1. Seed search
+          2. ``get_entry_entities`` → ``filter_entities_with_llm``
+          3. ``get_reachable_triples`` → ``filter_triples_with_llm``
+          4. ``resolve_docs_from_triples``
+
+        When ``use_llm_filter=True`` but ``llm`` is None, raises
+        ``NotImplementedError`` with step-by-step manual wiring instructions.
         """
+        # ---- Path 2, LLM provided — run automatically ----------------
+        if self.use_llm_filter and self.llm is not None:
+            seed_docs = self.seed_search(query)
+            seed_ids  = [doc.id for doc in seed_docs if doc.id]
+
+            entities      = self.get_entry_entities(seed_ids)
+            selected_ents = self.filter_entities_with_llm(query, entities, seed_docs)
+
+            triples          = self.get_reachable_triples(selected_ents)
+            selected_triples = self.filter_triples_with_llm(query, triples)
+
+            # Fall back to seed docs if the LLM selected nothing
+            if not selected_triples:
+                return seed_docs
+
+            return self.resolve_docs_from_triples(selected_triples)
+
+        # ---- Path 2, no LLM — raise with guidance --------------------
         if self.use_llm_filter:
             raise NotImplementedError(
-                "use_llm_filter=True: orchestrate retrieval via LangGraph instead of .invoke().\n\n"
-                "  seed_docs    = retriever.vectorstore.similarity_search(query, k=retriever.k)\n"
-                "  seed_ids     = [doc.id for doc in seed_docs]\n\n"
-                "  # Step 1 — collect candidate entities from seed documents\n"
-                "  entities     = retriever.get_entry_entities(seed_ids)\n\n"
-                "  # Step 2 — LLM selects relevant entities\n"
-                "  schema       = retriever.build_entity_filter_schema(entities)\n"
-                "  decision     = llm.with_structured_output(schema).invoke(query)\n"
-                "  selected_ents = {e: t for e, t in entities.items()\n"
-                "                   if getattr(decision, e.replace(' ', '_'), False)}\n\n"
-                "  # Step 3 — collect triples reachable from selected entities\n"
-                "  triples      = retriever.get_reachable_triples(selected_ents)\n\n"
-                "  # Step 4 — LLM selects relevant triples\n"
-                "  schema       = retriever.build_triple_filter_schema(triples)\n"
-                "  decision     = llm.with_structured_output(schema).invoke(query)\n"
-                "  selected_triples = [t for t in triples\n"
-                "                      if getattr(decision, t.id.replace('-','_'), False)]\n\n"
-                "  docs         = retriever.resolve_docs_from_triples(selected_triples)\n"
+                "use_llm_filter=True but no llm was provided.\n\n"
+                "Option A — pass an llm to the constructor for automatic execution:\n"
+                "    GLiNERGraphRetriever(..., use_llm_filter=True, llm=ChatOpenAI(...))\n\n"
+                "Option B — wire the steps manually in LangGraph:\n\n"
+                "    seed_docs        = retriever.seed_search(query)\n"
+                "    seed_ids         = [doc.id for doc in seed_docs]\n"
+                "    entities         = retriever.get_entry_entities(seed_ids)\n"
+                "    selected_ents    = retriever.filter_entities_with_llm(query, entities, seed_docs)\n"
+                "    triples          = retriever.get_reachable_triples(selected_ents)\n"
+                "    selected_triples = retriever.filter_triples_with_llm(query, triples)\n"
+                "    docs             = retriever.resolve_docs_from_triples(selected_triples)\n"
             )
 
-        # --- Auto path ---
-        seed_docs = self.vectorstore.similarity_search(query, k=self.k)
+        # ---- Path 1 — auto traversal ---------------------------------
+        seed_docs = self.seed_search(query)
         seed_ids  = [doc.id for doc in seed_docs if doc.id]
 
         # Graph not built yet — fall back to raw vector results
