@@ -416,10 +416,10 @@ class GLiNERGraphRetriever(BaseRetriever):
             return x or []
 
         effective_batch = batch_size if batch_size > 0 else len(texts)
+        batches         = [texts[i : i + effective_batch] for i in range(0, len(texts), effective_batch)]
         results: List[tuple[list, list]] = []
 
-        for start in range(0, len(texts), effective_batch):
-            batch = texts[start : start + effective_batch]
+        for batch in tqdm(batches, desc="Extracting graph edges", unit="batch"):
             raw_entities, raw_relations = self._ner_extractor.inference(
                 batch,
                 labels=self.labels,
@@ -428,7 +428,6 @@ class GLiNERGraphRetriever(BaseRetriever):
                 relation_threshold=self.relation_threshold,
                 return_relations=True,
             )
-            # GLiNER returns one list per text when given a list input
             for ents, rels in zip(raw_entities, raw_relations):
                 results.append((_unwrap(ents), _unwrap(rels)))
 
@@ -497,11 +496,7 @@ class GLiNERGraphRetriever(BaseRetriever):
         entity_rows:   list[dict] = []
         relation_rows: list[dict] = []
 
-        inferences = list(tqdm(
-            self._run_inference_batch(texts, batch_size=gliner_batch_size),
-            desc="Extracting graph edges",
-            total=len(texts),
-        ))
+        inferences = self._run_inference_batch(texts, batch_size=gliner_batch_size)
 
         for (raw_entities, raw_relations), child_id in zip(inferences, child_ids):
             entity_rows.extend(self._extract_entity_edges(raw_entities, child_id))
