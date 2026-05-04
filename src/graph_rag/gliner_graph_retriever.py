@@ -285,9 +285,7 @@ class GLiNERGraphRetriever(BaseRetriever):
     _parent_store:      Dict[str, Document]               = {}
     _last_trace:        Optional[RetrieverTrace]          = None
 
-    class Config:
-        arbitrary_types_allowed      = True
-        underscore_attrs_are_private = True
+    model_config = {"arbitrary_types_allowed": True}
 
     # ------------------------------------------------------------------
     # Public trace accessor
