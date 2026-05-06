@@ -215,6 +215,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field, create_model
 from tqdm import tqdm
 
+import torch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # ---------------------------------------------------------------------------
 # Column-name constants — single source of truth
 # ---------------------------------------------------------------------------
@@ -477,7 +480,7 @@ class GLiNERGraphRetriever(BaseRetriever):
     def model_post_init(self, __context: Any) -> None:
         self._validate_labels(self.labels)
         from gliner import GLiNER
-        self._ner_extractor = GLiNER.from_pretrained(self.model_path)
+        self._ner_extractor = GLiNER.from_pretrained(self.model_path).to(device)
         self._child_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.child_chunk_size,
             chunk_overlap=self.child_chunk_overlap,
