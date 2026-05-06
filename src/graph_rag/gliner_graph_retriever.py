@@ -545,10 +545,10 @@ class GLiNERGraphRetriever(BaseRetriever):
         if bm25_weight == 0.0 or self._bm25_retriever is None:
             return None
         try:
-            from langchain.retrievers import EnsembleRetriever
+            from langchain_classic.retrievers.ensemble import EnsembleRetriever
         except ImportError as exc:
             raise ImportError(
-                "EnsembleRetriever requires 'langchain'. "
+                "EnsembleRetriever requires 'langchain_classic'. "
                 "Install with: pip install langchain"
             ) from exc
 
