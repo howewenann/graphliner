@@ -28,50 +28,69 @@ The LLM always receives full parent context, not small chunks.
 QUERY KEYWORD EXPANSION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-When an LLM is provided at invoke time, the retriever first expands the
+When ``expand_llm`` is provided at invoke time, the retriever expands the
 user's natural-language query into a flat keyword string before running
 seed search.  This is purely a retrieval-time step — no ingestion cost.
 
-The prompt (adapted from ragit/prompts/extract_keyword.pdl) asks the LLM
-to return a JSON object with two fields:
+The prompt asks the LLM to return a JSON object with two fields:
   - ``keywords`` — terms directly from the query
   - ``extra``    — synonyms and related terms the user may not have named
 
-Both lists are joined into a single space-separated string:
+Both lists are joined into a single space-separated string used for
+**both** the BM25 and the dense legs of seed search.  The original
+query is preserved for LLM entity/triple filtering (Path 2), where
+natural language works better than a keyword bag.
 
-    "git conflicts merge conflicts conflict resolution git merge algorithm
-     version control three-way merge diff3 …"
+If ``expand_llm`` is not provided, the raw query is passed directly to
+seed search — no extra LLM call, no degradation.
 
-This expanded string is used for **both** the BM25 and the dense legs of
-seed search (richer signal for both).  The original query is still used
-for LLM entity/triple filtering, where natural language works better.
-
-If ``llm`` is not provided (Path 1 / auto), the raw query is passed
-directly to seed search — no extra LLM call, no degradation.
-
-    trace.expanded_query   # inspect what was generated (None if no LLM)
+    trace.expanded_query   # inspect what was generated (None if no expand_llm)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SEED RETRIEVAL: DENSE-ONLY vs ENSEMBLE (BM25 + DENSE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-If ``use_bm25=True`` (default False), a BM25Retriever is built over the
-child corpus and fused with the vectorstore via LangChain's
-EnsembleRetriever.  Weights are exposed as ``bm25_weight`` /
-``dense_weight`` constructor params AND as per-call overrides in
-``invoke`` / ``_get_relevant_documents``.
+A single ``bm25_weight`` parameter controls the retrieval mix:
+  - ``bm25_weight == 0`` (default) → dense-only; BM25 is never instantiated.
+  - ``bm25_weight > 0``  → ensemble (BM25 + dense); ``dense_weight`` is
+    implicitly ``1 - bm25_weight``.
+
+``bm25_weight`` can also be overridden per-call:
 
     retriever = GLiNERGraphRetriever(
         vectorstore=Chroma(...),
         model_path="urchade/gliner_mediumv2.1",
         labels=["person", "organization"],
-        use_bm25=True,          # enable ensemble
-        bm25_weight=0.4,        # BM25 share  (default 0.3)
-        dense_weight=0.6,       # dense share (default 0.7)
+        bm25_weight=0.4,    # enable ensemble (default dense-only = 0)
     )
 
     # per-call weight override:
-    docs = retriever.invoke("Who founded OpenAI?", bm25_weight=0.5, dense_weight=0.5)
+    docs = retriever.invoke("Who founded OpenAI?", bm25_weight=0.5)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LLM RESPONSIBILITIES — CLEANLY SEPARATED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Two independent ``invoke`` kwargs control LLM usage:
+
+  expand_llm   — generates an improved keyword string for seed search
+                 (improves both BM25 and dense recall)
+  filter_llm   — filters entities and triples during graph traversal
+                 (enables Path 2 / LLM-assisted path)
+
+Path selection depends **only** on ``filter_llm``:
+  - ``filter_llm is None``     → Path 1: automatic graph traversal
+  - ``filter_llm is not None`` → Path 2: LLM-assisted filtering
+
+``expand_llm`` does not affect path selection and can be used with
+either path.  Different models may be used for each role:
+
+    retriever.invoke(query)                              # Path 1, dense-only
+    retriever.invoke(query, expand_llm=fast_model)      # Path 1, expanded query
+    retriever.invoke(query, filter_llm=smart_model)     # Path 2, no expansion
+    retriever.invoke(query,                             # Path 2, both LLMs
+                     expand_llm=fast_model,
+                     filter_llm=smart_model)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GRAPH INSPECTION
@@ -92,7 +111,7 @@ a full retrieval call.
 PATH 2 RETURN POLICY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Path 2 now returns the *union* of:
+Path 2 returns the *union* of:
   - parents of seed children           (always present — grounding)
   - parents of entity-link 2-hop nbrs  (same as Path 1 auto expansion)
   - parents of LLM-selected triples    (the LLM's focused contribution)
@@ -120,7 +139,7 @@ graph construction internally.
         labels=["person", "organization", "location"],
         relations=["founded", "located_in"],
         persist_directory="./graph_store",
-        use_bm25=True,
+        bm25_weight=0.3,    # enable ensemble; 0 = dense-only (default)
     )
     retriever.from_documents(parent_docs, gliner_batch_size=8)
 
@@ -133,27 +152,33 @@ graph construction internally.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Path 1 — Auto traversal  (no llm provided)
--------------------------------------------
+Path 1 — Auto traversal  (no filter_llm provided)
+---------------------------------------------------
     docs = retriever.invoke("Who founded OpenAI?")
     docs = retriever.invoke("Who founded OpenAI?", k=6, traversal_depth=2)
 
-    # with per-call BM25/dense weight override
-    docs = retriever.invoke("Who founded OpenAI?", bm25_weight=0.5, dense_weight=0.5)
+    # with per-call BM25 weight override
+    docs = retriever.invoke("Who founded OpenAI?", bm25_weight=0.5)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Path 2 — LLM-assisted traversal  (llm provided at invoke time)
----------------------------------------------------------------
-    docs = retriever.invoke("Who founded OpenAI?", llm=ChatOpenAI(model="gpt-4o"))
+Path 2 — LLM-assisted traversal  (filter_llm provided at invoke time)
+----------------------------------------------------------------------
+    docs = retriever.invoke("Who founded OpenAI?",
+                            filter_llm=ChatOpenAI(model="gpt-4o"))
+
+    # With query expansion using a cheaper model:
+    docs = retriever.invoke("Who founded OpenAI?",
+                            expand_llm=ChatOpenAI(model="gpt-4o-mini"),
+                            filter_llm=ChatOpenAI(model="gpt-4o"))
 
     # Inspect what was selected:
     trace = retriever.last_trace
-    print(trace.expanded_query)      # keyword string used for seed search
+    print(trace.expanded_query)      # keyword string used for seed search (or None)
     print(trace.selected_entities)
     print(trace.selected_triples)
 
-    # Manual LangGraph wiring (no llm arg needed):
+    # Manual LangGraph wiring (no filter_llm arg needed):
     seed_children = retriever.seed_search(query, k=4)
     seed_ids      = [doc.id for doc in seed_children]
 
@@ -216,15 +241,14 @@ class RetrieverTrace:
 
     - Path 1 (auto):  ``selected_entities == candidate_entities`` and
       ``selected_triples == candidate_triples`` — nothing is filtered out.
-    - Path 2 (llm):   ``selected_*`` is the LLM's subset of ``candidate_*``.
+    - Path 2 (filter_llm):  ``selected_*`` is the LLM's subset of ``candidate_*``.
 
     Attributes:
         path:                ``"auto"`` or ``"llm"``.
         seed_child_ids:      Vectorstore IDs of seed children from similarity search.
-        expanded_query:      Keyword string generated by LLM expansion and passed to
-                             seed search.  ``None`` when no LLM is provided (Path 1).
+        expanded_query:      Keyword string generated by ``expand_llm`` and passed to
+                             seed search.  ``None`` when ``expand_llm`` is not provided.
         bm25_weight:         BM25 weight used for this call (None if BM25 disabled).
-        dense_weight:        Dense weight used for this call (None if BM25 disabled).
         candidate_entities:  All entities found in seed children (both paths).
         selected_entities:   Entities used for triple traversal (both paths).
         candidate_triples:   All triples reachable from selected entities (both paths).
@@ -235,7 +259,6 @@ class RetrieverTrace:
     seed_child_ids:      List[str]              = field(default_factory=list)
     expanded_query:      Optional[str]          = None
     bm25_weight:         Optional[float]        = None
-    dense_weight:        Optional[float]        = None
     candidate_entities:  Dict[str, str]         = field(default_factory=dict)
     selected_entities:   Dict[str, str]         = field(default_factory=dict)
     candidate_triples:   List["TripleRecord"]   = field(default_factory=list)
@@ -354,20 +377,24 @@ class GLiNERGraphRetriever(BaseRetriever):
     parent documents at retrieval time.
 
     Seed search is either:
-      - Dense-only (default): plain vectorstore similarity search.
-      - Ensemble (use_bm25=True): BM25Retriever + vectorstore fused via
-        LangChain EnsembleRetriever with configurable weights.
+      - Dense-only (default, ``bm25_weight=0``): plain vectorstore similarity
+        search.  BM25 is never instantiated.
+      - Ensemble (``bm25_weight > 0``): BM25Retriever + vectorstore fused via
+        LangChain EnsembleRetriever.  ``dense_weight`` is implicitly
+        ``1 - bm25_weight``.
 
-    Retrieval path is selected per-call:
-      - ``llm`` kwarg provided  → Path 2 (LLM-assisted traversal)
-      - no ``llm``              → Path 1 (auto graph traversal)
+    LLM usage is split into two independent per-call kwargs:
+      - ``expand_llm`` — generates a richer keyword query for seed search.
+        Does **not** affect path selection.
+      - ``filter_llm`` — filters graph entities and triples.
+        When provided, triggers Path 2 (LLM-assisted traversal).
 
     Per-call overrides (all optional kwargs to ``invoke``):
       - ``k``               — overrides ``self.k`` for this call
       - ``traversal_depth`` — overrides ``self.traversal_depth`` for this call
-      - ``llm``             — triggers Path 2 for this call
+      - ``expand_llm``      — LLM used for query expansion only
+      - ``filter_llm``      — LLM used for graph filtering; triggers Path 2
       - ``bm25_weight``     — overrides ``self.bm25_weight`` for this call
-      - ``dense_weight``    — overrides ``self.dense_weight`` for this call
 
     After every ``invoke``, ``retriever.last_trace`` holds a ``RetrieverTrace``
     with the full decision trail for debugging.
@@ -387,15 +414,9 @@ class GLiNERGraphRetriever(BaseRetriever):
         child_chunk_overlap:   Character overlap between adjacent child chunks.
         k:                     Default number of seed children from similarity search.
         traversal_depth:       Default BFS hops from each seed entity node.
-        use_bm25:              If True, build a BM25Retriever over child chunks and
-                               fuse it with the vectorstore via EnsembleRetriever.
-                               Requires ``rank_bm25`` to be installed.
-        bm25_weight:           Default weight for BM25 in the ensemble (0–1).
-                               Ignored when ``use_bm25=False``.
-        dense_weight:          Default weight for the dense retriever in the ensemble
-                               (0–1).  ``bm25_weight + dense_weight`` need not sum to
-                               1 — EnsembleRetriever normalises internally.
-                               Ignored when ``use_bm25=False``.
+        bm25_weight:           Weight for BM25 in the ensemble (0–1).
+                               ``0`` (default) → dense-only; BM25 is never built.
+                               ``> 0`` → BM25 enabled; ``dense_weight = 1 - bm25_weight``.
     """
 
     # Pydantic fields
@@ -412,9 +433,7 @@ class GLiNERGraphRetriever(BaseRetriever):
     child_chunk_overlap:   int                            = 64
     k:                     int                            = 4
     traversal_depth:       int                            = 1
-    use_bm25:              bool                           = False
-    bm25_weight:           float                          = 0.3
-    dense_weight:          float                          = 0.7
+    bm25_weight:           float                          = 0.0
 
     # Private runtime state
     _ner_extractor:     object                            = None
@@ -423,7 +442,7 @@ class GLiNERGraphRetriever(BaseRetriever):
     _graph_entity_link: Optional[nx.Graph]                = None
     _graph_triplet:     Optional[nx.MultiDiGraph]         = None
     _parent_store:      Dict[str, Document]               = {}
-    _child_corpus:      List[Document]                    = []   # needed by BM25
+    _child_corpus:      List[Document]                    = []
     _bm25_retriever:    object                            = None
     _last_trace:        Optional[RetrieverTrace]          = None
 
@@ -473,10 +492,11 @@ class GLiNERGraphRetriever(BaseRetriever):
         """
         (Re)build the BM25Retriever from the current ``_child_corpus``.
 
-        Called automatically after every ingestion step when ``use_bm25=True``.
-        Silently skips if BM25 is disabled or the corpus is empty.
+        Called automatically after every ingestion step when
+        ``bm25_weight > 0``.  Silently skips if BM25 is disabled or the
+        corpus is empty.
         """
-        if not self.use_bm25 or not self._child_corpus:
+        if self.bm25_weight == 0 or not self._child_corpus:
             return
         try:
             from langchain_community.retrievers import BM25Retriever
@@ -487,27 +507,21 @@ class GLiNERGraphRetriever(BaseRetriever):
             ) from exc
         self._bm25_retriever = BM25Retriever.from_documents(self._child_corpus)
 
-    def _make_ensemble_retriever(
-        self,
-        k: int,
-        bm25_weight: float,
-        dense_weight: float,
-    ):
+    def _make_ensemble_retriever(self, k: int, bm25_weight: float):
         """
-        Return a fresh EnsembleRetriever for this call using the supplied
-        weights and ``k``.  A new instance is built per-call so that per-call
-        weight overrides are respected without mutating shared state.
+        Return a fresh EnsembleRetriever for this call.  A new instance is
+        built per-call so that per-call weight overrides are respected without
+        mutating shared state.
 
         Args:
-            k:            Number of results each sub-retriever should return.
-            bm25_weight:  Weight for the BM25 leg.
-            dense_weight: Weight for the dense leg.
+            k:           Number of results each sub-retriever should return.
+            bm25_weight: Weight for the BM25 leg; dense weight is ``1 - bm25_weight``.
 
         Returns:
             A configured ``EnsembleRetriever``, or ``None`` if BM25 is
             disabled or the BM25 retriever has not been built yet.
         """
-        if not self.use_bm25 or self._bm25_retriever is None:
+        if bm25_weight == 0 or self._bm25_retriever is None:
             return None
         try:
             from langchain.retrievers import EnsembleRetriever
@@ -517,11 +531,9 @@ class GLiNERGraphRetriever(BaseRetriever):
                 "Install with: pip install langchain"
             ) from exc
 
-        # Clone bm25 retriever with the desired k
-        self._bm25_retriever.k = k  # BM25Retriever exposes .k directly
-
-        # Wrap vectorstore as a LangChain retriever with the desired k
+        self._bm25_retriever.k = k
         dense_retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
+        dense_weight    = 1.0 - bm25_weight
 
         return EnsembleRetriever(
             retrievers=[self._bm25_retriever, dense_retriever],
@@ -595,33 +607,28 @@ class GLiNERGraphRetriever(BaseRetriever):
         query: str,
         k: Optional[int] = None,
         bm25_weight: Optional[float] = None,
-        dense_weight: Optional[float] = None,
     ) -> List[Document]:
         """
         Run seed retrieval against child documents.
 
-        When ``use_bm25=True`` and a BM25 retriever has been built, an
+        When ``bm25_weight > 0`` and a BM25 retriever has been built, an
         EnsembleRetriever (BM25 + dense) is used.  Otherwise falls back to
         plain vectorstore similarity search.
 
         Args:
-            query:        The user's query string.
+            query:        The user's query string (already expanded if applicable).
             k:            Number of results; falls back to ``self.k``.
             bm25_weight:  Override the BM25 weight for this call only.
-            dense_weight: Override the dense weight for this call only.
+                          Falls back to ``self.bm25_weight``.
 
         Returns:
             Child chunk documents carrying ``parent_id`` metadata.
         """
-        effective_k      = k            if k            is not None else self.k
-        eff_bm25_weight  = bm25_weight  if bm25_weight  is not None else self.bm25_weight
-        eff_dense_weight = dense_weight if dense_weight is not None else self.dense_weight
+        effective_k          = k           if k           is not None else self.k
+        effective_bm25_weight = bm25_weight if bm25_weight is not None else self.bm25_weight
 
-        ensemble = self._make_ensemble_retriever(effective_k, eff_bm25_weight, eff_dense_weight)
+        ensemble = self._make_ensemble_retriever(effective_k, effective_bm25_weight)
         if ensemble is not None:
-            # EnsembleRetriever.invoke returns Documents without guaranteed IDs
-            # when used through the retriever interface; documents already carry
-            # IDs from ingestion via vectorstore.add_documents.
             return ensemble.invoke(query)
 
         return self.vectorstore.similarity_search(query, k=effective_k)
@@ -804,14 +811,13 @@ class GLiNERGraphRetriever(BaseRetriever):
     # Persistence
     # ------------------------------------------------------------------
 
-    def _parquet_path(self)  -> Path: return Path(self.persist_directory) / f"{self.collection_name}.parquet"
-    def _manifest_path(self) -> Path: return Path(self.persist_directory) / f"{self.collection_name}.json"
+    def _parquet_path(self)      -> Path: return Path(self.persist_directory) / f"{self.collection_name}.parquet"
+    def _manifest_path(self)     -> Path: return Path(self.persist_directory) / f"{self.collection_name}.json"
     def _parent_store_path(self) -> Path: return Path(self.persist_directory) / f"{self.collection_name}.parents.json"
-    def _corpus_path(self) -> Path: return Path(self.persist_directory) / f"{self.collection_name}.corpus.json"
+    def _corpus_path(self)       -> Path: return Path(self.persist_directory) / f"{self.collection_name}.corpus.json"
 
     _MANIFEST_KEYS = ["labels", "relations", "threshold", "relation_threshold",
-                      "child_chunk_size", "child_chunk_overlap", "use_bm25",
-                      "bm25_weight", "dense_weight"]
+                      "child_chunk_size", "child_chunk_overlap", "bm25_weight"]
 
     def _persist(self) -> None:
         if self.persist_directory is None or self._edge_df is None:
@@ -822,19 +828,19 @@ class GLiNERGraphRetriever(BaseRetriever):
             json.dumps({k: getattr(self, k) for k in self._MANIFEST_KEYS}, indent=2),
             encoding="utf-8",
         )
+        # Use Pydantic-native serialization for parent store and corpus
         self._parent_store_path().write_text(
-            json.dumps({
-                pid: {"page_content": doc.page_content, "metadata": doc.metadata, "id": doc.id}
-                for pid, doc in self._parent_store.items()
-            }, indent=2),
+            json.dumps(
+                {pid: doc.model_dump() for pid, doc in self._parent_store.items()},
+                indent=2,
+            ),
             encoding="utf-8",
         )
-        # Persist child corpus so BM25 can be rebuilt on load
         self._corpus_path().write_text(
-            json.dumps([
-                {"page_content": doc.page_content, "metadata": doc.metadata, "id": doc.id}
-                for doc in self._child_corpus
-            ], indent=2),
+            json.dumps(
+                [doc.model_dump() for doc in self._child_corpus],
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
@@ -866,16 +872,16 @@ class GLiNERGraphRetriever(BaseRetriever):
         if not parent_store_path.exists():
             raise FileNotFoundError(f"Parent store not found: {parent_store_path}")
         self._parent_store = {
-            pid: Document(page_content=e["page_content"], metadata=e["metadata"], id=e["id"])
-            for pid, e in json.loads(parent_store_path.read_text(encoding="utf-8")).items()
+            pid: Document.model_validate(data)
+            for pid, data in json.loads(parent_store_path.read_text(encoding="utf-8")).items()
         }
 
         # Restore child corpus and rebuild BM25 if applicable
         corpus_path = self._corpus_path()
         if corpus_path.exists():
             self._child_corpus = [
-                Document(page_content=e["page_content"], metadata=e["metadata"], id=e.get("id"))
-                for e in json.loads(corpus_path.read_text(encoding="utf-8"))
+                Document.model_validate(data)
+                for data in json.loads(corpus_path.read_text(encoding="utf-8"))
             ]
             self._rebuild_bm25()
 
@@ -897,7 +903,6 @@ class GLiNERGraphRetriever(BaseRetriever):
         """
         children  = self._split_to_children(documents)
         child_ids = self.vectorstore.add_documents(children)
-        # Tag children with their assigned vectorstore IDs for BM25 corpus
         for doc, assigned_id in zip(children, child_ids):
             doc.id = assigned_id
         self._child_corpus = children
@@ -991,20 +996,7 @@ class GLiNERGraphRetriever(BaseRetriever):
                              to ``self.traversal_depth``.
 
         Returns:
-            An ``EntitySnapshot`` with the following populated fields:
-
-            - ``in_entity_link_graph``   — presence flag
-            - ``in_triplet_graph``       — presence flag
-            - ``connected_chunk_ids``    — depth-1 chunk neighbours in the
-                                          entity-link graph
-            - ``entity_link_neighbours`` — ``{node: hop_distance}`` for all
-                                          nodes reachable within
-                                          ``traversal_depth`` hops (entity-link
-                                          graph); chunk nodes are included so you
-                                          can see which documents the neighbours
-                                          co-occur in
-            - ``outgoing_triples``       — all triples where entity is the head
-            - ``incoming_triples``       — all triples where entity is the tail
+            An ``EntitySnapshot``.
 
         Example::
 
@@ -1020,7 +1012,6 @@ class GLiNERGraphRetriever(BaseRetriever):
         if self._graph_entity_link is not None and normalised in self._graph_entity_link:
             snapshot.in_entity_link_graph = True
 
-            # Depth-1 neighbours that are chunk nodes
             snapshot.connected_chunk_ids = [
                 n for n in self._graph_entity_link.neighbors(normalised)
                 if str(n).startswith("_") or (
@@ -1032,7 +1023,6 @@ class GLiNERGraphRetriever(BaseRetriever):
                 )
             ]
 
-            # All reachable nodes within depth, keyed by distance
             lengths = nx.single_source_shortest_path_length(
                 self._graph_entity_link, normalised, cutoff=effective_depth
             )
@@ -1046,14 +1036,12 @@ class GLiNERGraphRetriever(BaseRetriever):
         if self._graph_triplet is not None and normalised in self._graph_triplet:
             snapshot.in_triplet_graph = True
 
-            # Helper to look up entity type from edge_df
             def _etype(name: str) -> str:
                 if self._edge_df is None:
                     return ""
                 row = self._edge_df.loc[self._edge_df["head"] == name, "head_type"]
                 return row.iloc[0] if not row.empty else ""
 
-            # Outgoing triples (entity is head)
             for _, tail, edge_data in self._graph_triplet.out_edges(normalised, data=True):
                 snapshot.outgoing_triples.append(TripleRecord(
                     id          = str(uuid.uuid4()),
@@ -1066,7 +1054,6 @@ class GLiNERGraphRetriever(BaseRetriever):
                     edge_source = edge_data.get("edge_source", ""),
                 ))
 
-            # Incoming triples (entity is tail)
             for head, _, edge_data in self._graph_triplet.in_edges(normalised, data=True):
                 snapshot.incoming_triples.append(TripleRecord(
                     id          = str(uuid.uuid4()),
@@ -1288,21 +1275,15 @@ class GLiNERGraphRetriever(BaseRetriever):
         Use the LLM to expand a natural-language query into a flat keyword
         string suitable for BM25 (and dense) seed search.
 
-        The prompt is adapted from ragit/prompts/extract_keyword.pdl.
-        Uses ``with_structured_output`` so the schema is communicated via
-        the model's native tool-calling / JSON-mode API — no manual JSON
-        parsing or fence-stripping needed.
-
+        Uses ``with_structured_output`` so no manual JSON parsing is needed.
         Both ``keywords`` and ``extra`` from the response are joined into a
-        single space-separated string, e.g.::
-
-            "git conflicts merge conflicts conflict resolution three-way merge diff3 …"
+        single space-separated string.  On any failure the original query is
+        returned unchanged so retrieval never hard-fails.
 
         Args:
             query: The user's original query string.
             llm:   Any LangChain chat model that supports
-                   ``with_structured_output``.  On any failure the original
-                   query is returned unchanged so retrieval never hard-fails.
+                   ``with_structured_output``.
 
         Returns:
             A space-separated keyword string, or ``query`` on any failure.
@@ -1325,8 +1306,8 @@ class GLiNERGraphRetriever(BaseRetriever):
             combined = " ".join(t for t in result.keywords + result.extra if t)
             return combined if combined.strip() else query
         except Exception:
-            # Any LLM or validation error → fall back to raw query silently
             return query
+
     # ------------------------------------------------------------------
     # LangChain BaseRetriever interface
     # ------------------------------------------------------------------
@@ -1335,12 +1316,12 @@ class GLiNERGraphRetriever(BaseRetriever):
         self,
         query: str,
         *,
-        run_manager: CallbackManagerForRetrieverRun,
+        run_manager:     CallbackManagerForRetrieverRun,
         k:               Optional[int]   = None,
         traversal_depth: Optional[int]   = None,
-        llm:             Optional[Any]   = None,
+        expand_llm:      Optional[Any]   = None,
+        filter_llm:      Optional[Any]   = None,
         bm25_weight:     Optional[float] = None,
-        dense_weight:    Optional[float] = None,
     ) -> List[Document]:
         """
         Unified retrieval dispatch — always returns parent documents.
@@ -1348,85 +1329,80 @@ class GLiNERGraphRetriever(BaseRetriever):
         Per-call overrides (all optional):
           - ``k``               — number of seed children
           - ``traversal_depth`` — BFS hops for graph expansion
-          - ``llm``             — triggers Path 2 (LLM-assisted) when provided
-          - ``bm25_weight``     — BM25 share for the ensemble seed search
-          - ``dense_weight``    — dense share for the ensemble seed search
-
-        ``bm25_weight`` / ``dense_weight`` are only meaningful when
-        ``use_bm25=True``; they are silently ignored otherwise.  They are
-        recorded in the trace regardless so you always know what weights
-        were in effect.
+          - ``expand_llm``      — LLM for query keyword expansion; improves seed
+                                  search quality (both BM25 and dense legs)
+          - ``filter_llm``      — LLM for graph filtering; triggers Path 2 when
+                                  provided.  Path selection depends **only** on
+                                  this parameter.
+          - ``bm25_weight``     — BM25 share for this call; ``0`` = dense-only.
+                                  Falls back to ``self.bm25_weight``.
 
         A ``RetrieverTrace`` is stored in ``self.last_trace`` after every call.
         Both paths populate ``candidate_entities`` and ``candidate_triples``
         so you can always inspect what the graph found.
 
-        ── Path 1 (no ``llm``) ──────────────────────────────────────────
-          1. Seed search with raw query (dense-only or ensemble)
+        ── Path 1 (``filter_llm`` is None) ──────────────────────────────
+          0. (Optional) ``expand_query_keywords`` via ``expand_llm``
+          1. Seed search with raw or expanded query
           2. ``get_entry_entities`` + ``get_reachable_triples`` (no filtering)
           3. Union of seed IDs + entity-link 2-hop IDs + triple child IDs
              → deduplicated parent docs
 
-        ── Path 2 (``llm`` provided) ────────────────────────────────────
-          0. ``expand_query_keywords`` → expanded keyword string for seed search
-          1. Seed search with expanded query (dense-only or ensemble)
+        ── Path 2 (``filter_llm`` provided) ──────────────────────────────
+          0. (Optional) ``expand_query_keywords`` via ``expand_llm``
+          1. Seed search with raw or expanded query
           2. ``get_entry_entities`` → ``filter_entities_with_llm`` (original query)
           3. ``get_reachable_triples`` → ``filter_triples_with_llm`` (original query)
           4. Union of:
                - parents of seed children              (grounding baseline)
                - parents of entity-link 2-hop nbrs    (same expansion as Path 1)
                - parents of LLM-selected triples      (focused graph signal)
-             Falls back to seed parents only if both graph layers are empty.
 
         ``trace.expanded_query`` records the keyword string used for seed
-        search (``None`` when no LLM is provided).
+        search (``None`` when ``expand_llm`` is not provided).
         """
-        effective_k      = k            if k            is not None else self.k
-        effective_depth  = traversal_depth if traversal_depth is not None else self.traversal_depth
-        eff_bm25_weight  = bm25_weight  if bm25_weight  is not None else self.bm25_weight
-        eff_dense_weight = dense_weight if dense_weight is not None else self.dense_weight
-        trace            = RetrieverTrace()
+        effective_k          = k           if k           is not None else self.k
+        effective_depth      = traversal_depth if traversal_depth is not None else self.traversal_depth
+        effective_bm25_weight = bm25_weight if bm25_weight is not None else self.bm25_weight
+        trace                = RetrieverTrace()
 
-        # ── Step 0: keyword expansion (Path 2 only) ───────────────────
-        # The expanded string is used for seed search (both BM25 and dense).
-        # The original query is preserved for LLM entity/triple filtering
-        # because natural language works better there than a keyword bag.
+        # ── Step 0: keyword expansion (optional, independent of path) ─
+        # expand_llm affects the search query only; filter_llm determines
+        # the path.  The original query is always preserved for LLM
+        # entity/triple filtering where natural language works better.
         search_query = query
-        if llm is not None:
-            search_query          = self.expand_query_keywords(query, llm)
-            trace.expanded_query  = search_query
+        if expand_llm is not None:
+            search_query         = self.expand_query_keywords(query, expand_llm)
+            trace.expanded_query = search_query
 
-        seed_children       = self.seed_search(
+        seed_children        = self.seed_search(
             search_query,
             k=effective_k,
-            bm25_weight=eff_bm25_weight,
-            dense_weight=eff_dense_weight,
+            bm25_weight=effective_bm25_weight,
         )
-        seed_ids            = [doc.id for doc in seed_children if doc.id]
-        trace.seed_child_ids = seed_ids
-        trace.bm25_weight    = eff_bm25_weight  if self.use_bm25 else None
-        trace.dense_weight   = eff_dense_weight if self.use_bm25 else None
+        seed_ids             = [doc.id for doc in seed_children if doc.id]
+        trace.seed_child_ids  = seed_ids
+        trace.bm25_weight     = effective_bm25_weight if effective_bm25_weight > 0 else None
 
         # Shared: entity-link 2-hop expansion (same for both paths)
         entity_linked_ids = self._entity_link_expanded_ids(seed_ids)
 
-        # ── Path 2 — LLM-assisted ──────────────────────────────────────
-        if llm is not None:
+        # ── Path 2 — LLM-assisted (filter_llm provided) ───────────────
+        if filter_llm is not None:
             trace.path = "llm"
 
-            entities                  = self.get_entry_entities(seed_ids)
-            trace.candidate_entities  = entities
+            entities                 = self.get_entry_entities(seed_ids)
+            trace.candidate_entities = entities
 
-            selected_ents             = self.filter_entities_with_llm(query, entities, seed_children, llm)
-            trace.selected_entities   = selected_ents
+            selected_ents            = self.filter_entities_with_llm(query, entities, seed_children, filter_llm)
+            trace.selected_entities  = selected_ents
 
-            triples                   = self.get_reachable_triples(selected_ents, traversal_depth=effective_depth)
-            trace.candidate_triples   = triples
+            triples                  = self.get_reachable_triples(selected_ents, traversal_depth=effective_depth)
+            trace.candidate_triples  = triples
 
-            selected_triples          = self.filter_triples_with_llm(query, triples, llm)
-            trace.selected_triples    = selected_triples
+            selected_triples         = self.filter_triples_with_llm(query, triples, filter_llm)
+            trace.selected_triples   = selected_triples
 
-            # Union: seed + entity-link expansion + LLM-selected triple sources
             triple_child_ids = {t.edge_source for t in selected_triples if t.edge_source}
             all_child_ids    = list(set(seed_ids) | entity_linked_ids | triple_child_ids)
             parents          = self._parents_from_child_ids(all_child_ids)
@@ -1435,17 +1411,17 @@ class GLiNERGraphRetriever(BaseRetriever):
             self._last_trace          = trace
             return parents
 
-        # ── Path 1 — auto traversal ────────────────────────────────────
+        # ── Path 1 — auto traversal (filter_llm is None) ──────────────
         # candidate_* == selected_* (no LLM filter).
         trace.path = "auto"
 
         entities                 = self.get_entry_entities(seed_ids)
         trace.candidate_entities = entities
-        trace.selected_entities  = entities          # all kept — no filter
+        trace.selected_entities  = entities         # all kept — no filter
 
         triples                  = self.get_reachable_triples(entities, traversal_depth=effective_depth)
         trace.candidate_triples  = triples
-        trace.selected_triples   = triples           # all kept — no filter
+        trace.selected_triples   = triples          # all kept — no filter
 
         triple_child_ids = {t.edge_source for t in triples if t.edge_source}
         all_child_ids    = list(set(seed_ids) | entity_linked_ids | triple_child_ids)
