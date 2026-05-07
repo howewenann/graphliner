@@ -124,6 +124,24 @@ never shrinks the result below the seed baseline.  The trace records
 ``selected_triples`` so you can still see exactly what the LLM picked.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TRIPLE DEDUPLICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+``get_reachable_triples`` deduplicates on the semantic triple
+``(head, relation, tail)`` rather than on ``(head, relation, tail, edge_source)``.
+When the same triple is extracted from multiple chunks, a single
+``TripleRecord`` is produced whose ``edge_source`` is a pipe-separated
+(``|``) string of all contributing chunk IDs.  This prevents duplicate
+description strings from being shown to the LLM during filtering and
+keeps token usage proportional to the number of *unique* relationships,
+not the number of chunks.  Parent resolution still covers all provenance
+chunks because ``resolve_parents_from_triples`` (and the inline
+``triple_child_ids`` sets in ``_get_relevant_documents``) split
+``edge_source`` on ``|`` before resolving.  ``_parents_from_child_ids``
+deduplicates by ``parent_id``, so multiple chunks from the same parent
+document always resolve to a single copy of that parent.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PIPELINE OVERVIEW
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -314,6 +332,11 @@ class TripleRecord(BaseModel):
     """
     A single graph triple together with a stable ID and a human-readable
     description that can be shown to an LLM for filtering.
+
+    ``edge_source`` is a pipe-separated (``|``) string of all chunk IDs from
+    which this semantic triple was extracted.  A single TripleRecord may
+    therefore represent the same relationship observed across multiple chunks.
+    Parent resolution splits on ``|`` to recover all contributing chunk IDs.
     """
     id:          str
     text:        str
@@ -322,7 +345,7 @@ class TripleRecord(BaseModel):
     relation:    str
     tail:        str
     tail_type:   str
-    edge_source: str
+    edge_source: str   # pipe-separated chunk IDs, e.g. "id1|id2|id3"
 
 
 # ---------------------------------------------------------------------------
@@ -1191,6 +1214,13 @@ class GLiNERGraphRetriever(BaseRetriever):
         """
         Fetch triples reachable from selected entities up to ``traversal_depth`` hops.
 
+        Deduplicates on the semantic triple ``(head, relation, tail)``.  When the
+        same triple is extracted from multiple chunks, a single ``TripleRecord`` is
+        produced whose ``edge_source`` is a pipe-separated string of all
+        contributing chunk IDs (e.g. ``"id1|id2|id3"``).  This prevents duplicate
+        description strings from reaching the LLM during filtering and keeps token
+        usage proportional to the number of unique relationships, not chunks.
+
         ``tail_type`` is looked up from the ``head`` column of the entity-link
         rows in ``_edge_df``, since entities appear there as heads.  If the tail
         entity was never itself a head in any extracted entity edge (e.g. it only
@@ -1203,14 +1233,17 @@ class GLiNERGraphRetriever(BaseRetriever):
             traversal_depth:   Hops; falls back to ``self.traversal_depth``.
 
         Returns:
-            List of ``TripleRecord`` objects.
+            List of ``TripleRecord`` objects, one per unique semantic triple.
         """
         if self._graph_triplet is None:
             return []
 
-        depth           = traversal_depth or self.traversal_depth
-        seen_edge_keys: set[tuple]         = set()
-        records:        List[TripleRecord] = []
+        depth = traversal_depth or self.traversal_depth
+
+        # semantic key → ordered list of contributing chunk IDs (provenance)
+        seen_semantic: dict[tuple, list[str]] = {}
+        # preserve insertion order for the final record list
+        ordered_keys:  list[tuple]            = []
 
         for entity in selected_entities:
             if entity not in self._graph_triplet:
@@ -1222,28 +1255,39 @@ class GLiNERGraphRetriever(BaseRetriever):
                 if current_depth >= depth:
                     continue
                 for _, neighbour, edge_data in self._graph_triplet.out_edges(node, data=True):
-                    edge_key = (node, neighbour, edge_data.get("relation"), edge_data.get("edge_source"))
-                    if edge_key not in seen_edge_keys:
-                        seen_edge_keys.add(edge_key)
-                        head_type = selected_entities.get(node, "")
-                        tail_type = ""
-                        if self._edge_df is not None:
-                            tail_row = self._edge_df.loc[self._edge_df["head"] == neighbour, "head_type"]
-                            if not tail_row.empty:
-                                tail_type = tail_row.iloc[0]
-                        records.append(TripleRecord(
-                            id          = str(uuid.uuid4()),
-                            text        = f"{node} ({head_type}) → {edge_data.get('relation')} → {neighbour} ({tail_type})",
-                            head        = node,
-                            head_type   = head_type,
-                            relation    = edge_data.get("relation", ""),
-                            tail        = neighbour,
-                            tail_type   = tail_type,
-                            edge_source = edge_data.get("edge_source", ""),
-                        ))
+                    semantic_key = (node, neighbour, edge_data.get("relation"))
+                    edge_source  = edge_data.get("edge_source", "")
+                    if semantic_key not in seen_semantic:
+                        seen_semantic[semantic_key] = []
+                        ordered_keys.append(semantic_key)
+                    if edge_source:
+                        seen_semantic[semantic_key].append(edge_source)
                     if neighbour not in visited_nodes:
                         visited_nodes.add(neighbour)
                         queue.append((neighbour, current_depth + 1))
+
+        # Build one TripleRecord per unique semantic triple.
+        # dict.fromkeys preserves insertion order while deduplicating chunk IDs.
+        records: List[TripleRecord] = []
+        for semantic_key in ordered_keys:
+            node, neighbour, relation = semantic_key
+            head_type = selected_entities.get(node, "")
+            tail_type = ""
+            if self._edge_df is not None:
+                tail_row = self._edge_df.loc[self._edge_df["head"] == neighbour, "head_type"]
+                if not tail_row.empty:
+                    tail_type = tail_row.iloc[0]
+            all_sources = list(dict.fromkeys(seen_semantic[semantic_key]))
+            records.append(TripleRecord(
+                id          = str(uuid.uuid4()),
+                text        = f"{node} ({head_type}) → {relation} → {neighbour} ({tail_type})",
+                head        = node,
+                head_type   = head_type,
+                relation    = relation or "",
+                tail        = neighbour,
+                tail_type   = tail_type,
+                edge_source = "|".join(all_sources),
+            ))
         return records
 
     def filter_triples_with_llm(
@@ -1277,9 +1321,20 @@ class GLiNERGraphRetriever(BaseRetriever):
 
     def resolve_parents_from_triples(self, selected_triples: List[TripleRecord]) -> List[Document]:
         """
-        Resolve child IDs from selected triples → parent documents.
+        Resolve child IDs from selected triples → deduplicated parent documents.
+
+        ``edge_source`` on each ``TripleRecord`` is a pipe-separated string of
+        all chunk IDs that witnessed the triple.  All are unpacked here so that
+        every contributing chunk (and therefore its parent) is considered.
+        ``_parents_from_child_ids`` deduplicates by ``parent_id``, so multiple
+        chunks from the same parent resolve to a single copy of that parent.
         """
-        child_ids = list({t.edge_source for t in selected_triples if t.edge_source})
+        child_ids = list({
+            source
+            for t in selected_triples
+            for source in t.edge_source.split("|")
+            if source
+        })
         return self._parents_from_child_ids(child_ids)
 
     # ------------------------------------------------------------------
@@ -1471,9 +1526,14 @@ class GLiNERGraphRetriever(BaseRetriever):
             selected_triples         = self.filter_triples_with_llm(query, triples, filter_llm)
             trace.selected_triples   = selected_triples
 
-            triple_child_ids = {t.edge_source for t in selected_triples if t.edge_source}
-            all_child_ids    = list(set(seed_ids) | entity_linked_ids | triple_child_ids)
-            parents          = self._parents_from_child_ids(all_child_ids)
+            triple_child_ids = {
+                source
+                for t in selected_triples
+                for source in t.edge_source.split("|")
+                if source
+            }
+            all_child_ids = list(set(seed_ids) | entity_linked_ids | triple_child_ids)
+            parents       = self._parents_from_child_ids(all_child_ids)
 
             trace.returned_parent_ids = [p.id for p in parents if p.id]
             self._last_trace          = trace
@@ -1490,8 +1550,13 @@ class GLiNERGraphRetriever(BaseRetriever):
         trace.candidate_triples  = triples
         trace.selected_triples   = triples
 
-        triple_child_ids = {t.edge_source for t in triples if t.edge_source}
-        all_child_ids    = list(set(seed_ids) | entity_linked_ids | triple_child_ids)
+        triple_child_ids = {
+            source
+            for t in triples
+            for source in t.edge_source.split("|")
+            if source
+        }
+        all_child_ids = list(set(seed_ids) | entity_linked_ids | triple_child_ids)
 
         parents                   = self._parents_from_child_ids(all_child_ids)
         trace.returned_parent_ids = [p.id for p in parents if p.id]
